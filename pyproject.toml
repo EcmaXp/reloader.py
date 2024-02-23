@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "reloader.py"
+version = "0.1.0"
+description = "A simple script reloader"
+license = "MIT"
+authors = ["EcmaXp <ecmaxp@ecmaxp.kr>"]
+packages = [
+    {include = "reloader.py"},
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+watchdog = "^4.0.0"
+
+[tool.poetry.scripts]
+"reloader" = "reloader:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
