@@ -8,71 +8,91 @@ usage: python3 -m reloader script.py
 
 import ast
 import inspect
+import linecache
 import sys
+import traceback
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from functools import cache
 from os import PathLike
 from pathlib import Path
 from queue import Queue
-from time import monotonic
+from threading import Thread
+from time import monotonic, sleep
 from types import ModuleType
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, ClassVar
 
 from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
 
-class DebounceFileEventHandler[T]:
-    def __init__(self):
-        self.queue = Queue()
-        self.interval = 0.1
-        self.paths = {}
-        self.lasts = {}
+def get_linenos(node: ast.AST) -> tuple[int, int]:
+    lineno = float("inf")
+    end_lineno = float("-inf")
 
-    @property
-    def parents(self):
-        return {str(Path(path).parent) for path in self.paths}
+    for child in ast.walk(node):
+        if hasattr(child, "lineno"):
+            lineno = min(lineno, child.lineno)
+        if hasattr(child, "end_lineno"):
+            end_lineno = max(end_lineno, child.end_lineno)
+
+    return lineno, end_lineno
+
+
+class Debouncer:
+    def __init__(self, interval: float = 0.1):
+        self.interval = interval
+        self.last = 0
+
+    def __call__(self):
+        now = monotonic()
+        if now - self.last < self.interval:
+            return False
+
+        self.last = now
+        return True
+
+
+class DebounceFileSystemEventHandler[T]:
+    def __init__(self, observer: Observer):
+        self.observer = observer
+        self.queue = Queue()
+        self.parents = set()
+        self.paths = {}
+        self.debouncers = {}
 
     def dispatch(self, event: FileSystemEvent):
-        if event.event_type not in ("created", "modified"):
-            return
+        if event.event_type in ("created", "modified"):
+            path = Path(event.src_path).resolve()
+            obj = self.paths.get(path)
+            if obj and self.debouncers[path]():
+                self.queue.put(obj)
 
-        path = event.src_path
-        obj = self.paths.get(path)
-        if not obj:
-            return
+    def add(self, path: Path | PathLike | str, obj: T):
+        path = Path(path).resolve()
+        parent = path.parent
 
-        now = monotonic()
-        if now - self.lasts[path] < self.interval:
-            return
-
-        self.lasts[path] = now
-        self.queue.put(obj)
-
-    def add(self, path: Path | PathLike | str | bytes, obj: T):
-        path = str(Path(path).resolve())
         self.paths[path] = obj
-        self.lasts[path] = 0
-        self.queue.put_nowait(obj)
+        self.debouncers[path] = Debouncer()
 
-    def schedule(self, observer: Observer):
-        for parent in self.parents:
-            observer.schedule(self, str(parent))
+        if parent not in self.parents:
+            self.parents.add(parent)
+            self.observer.schedule(self, str(parent))
 
     def wait(self) -> T:
         return self.queue.get()
 
 
 class Chunk:
-    def __init__(self, node: ast.AST, filename: str):
+    def __init__(self, node: ast.AST, code: str, filename: str):
         self.node = node
-        self.code = ast.unparse(node)
+        self.code = code
         self.filename = filename
         self.lineno = node.lineno if hasattr(node, "lineno") else 0
 
@@ -98,25 +118,14 @@ class Chunk:
         exec(self.compile(), module_globals, module_globals)
 
 
-class Chunks(Chunk):
-    def __init__(self, node: ast.Module, filename: str):
-        self.filename = filename
-        self.chunks = [Chunk(block, filename) for block in node.body]
-        super().__init__(node, filename)
-
-    def __iter__(self) -> Iterator[Chunk]:
-        return iter(self.chunks)
-
-    @classmethod
-    def from_path(cls, path: Path | PathLike | str | bytes):
-        path = Path(path).resolve()
-        tree = ast.parse(path.read_text())
-        return cls(tree, str(path))
-
-
 class Patcher:
-    def __init__(self, module_globals: dict):
-        self.module_globals = module_globals
+    @contextmanager
+    def patch(self, module_globals: dict):
+        old_globals = module_globals.copy()
+        try:
+            yield
+        finally:
+            self.patch_module(old_globals, module_globals)
 
     def patch_module(self, old_globals: dict, new_globals: dict):
         for key, new_value in new_globals.items():
@@ -139,12 +148,14 @@ class Patcher:
     def patch_callable(self, old_callable: Callable, new_callable: Callable):
         self.patch_vars(old_callable, new_callable)
 
-        try:
-            old_callable.__code__ = new_callable.__code__  # noqa
-        except AttributeError:
-            old_func = inspect.unwrap(old_callable)
-            new_func = inspect.unwrap(new_callable)
-            old_func.__code__ = new_func.__code__  # noqa
+        old_func = inspect.unwrap(old_callable)
+        new_func = inspect.unwrap(new_callable)
+
+        for name in ("__code__", "__annotations__", "__kwdefaults__", "__defaults__"):
+            if hasattr(new_callable, name):
+                setattr(old_callable, name, getattr(new_callable, name))
+            elif hasattr(new_func, name):
+                setattr(old_func, name, getattr(new_func, name))
 
         return old_callable
 
@@ -157,128 +168,199 @@ class Patcher:
 
             setattr(old_obj, key, self.patch_object(old_value, new_value))
 
-    @contextmanager
-    def patch(self, module_globals: dict):
-        old_globals = module_globals.copy()
-        try:
-            yield
-        finally:
-            self.patch_module(old_globals, module_globals)
-
 
 class Reloader:
-    def __init__(
-        self,
-        module_name: str,
-        module_path: Path | PathLike | str | bytes,
-        module_globals: dict,
-        source: Path | ModuleType,
-    ):
-        self.module_name = module_name
-        self.module_path = Path(module_path).resolve()
-        self.globals = module_globals
-        self.chunks = None
-        self.patcher = Patcher(self.globals)
-        self.source = source
+    def __init__(self, module: ModuleType, *, module_is_script: bool = False):
+        self.module = module
+        self.module_is_script = module_is_script
+        self.executed_chunks = [] if self.module_is_script else self.load_chunks()
+        self.patcher = Patcher()
 
-    def __post_init__(self):
-        self.chunks = Chunks.from_path(self.module_path)
-        self.patcher = Patcher(self.globals)
-
-    def step(self):
-        if self.chunks is None:
-            self.run()
-        else:
-            self.reload()
-
-    def run(self):
-        if self.chunks is not None:
-            return
-
-        chunks = Chunks.from_path(self.module_path)
-        if isinstance(self.source, Path):
-            chunks.exec(self.globals)
-
-        self.chunks = chunks
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self.module!r}, is_script={self.module_is_script!r})"
 
     def reload(self):
-        chunks = Chunks.from_path(self.module_path)
-        counter = Counter(chunks) - Counter(self.chunks)
-        self.chunks = chunks
+        found_chunks = self.load_chunks()
+        counter = Counter(found_chunks) - Counter(self.executed_chunks)
 
-        for chunk in self.chunks:
-            if counter[chunk] > 0 or (
-                not isinstance(self.source, ModuleType) and chunk.is_main()
-            ):
+        self.executed_chunks = []
+        for chunk in found_chunks:
+            if counter[chunk] > 0 or (self.module_is_script and chunk.is_main()):
                 counter[chunk] -= 1
-                with self.patcher.patch(self.globals):
-                    chunk.exec(self.globals)
+                with self.patcher.patch(self.module.__dict__):
+                    chunk.exec(self.module.__dict__)
 
-    @classmethod
-    def from_script(
-        cls,
-        script_path: Path | PathLike | str | bytes,
-        module_name: str = "__main__",
-    ):
-        script_path = Path(script_path).resolve()
+            self.executed_chunks.append(chunk)
 
-        return cls(
-            module_path=script_path,
-            module_name=module_name,
-            module_globals={
-                "__name__": module_name,
-                "__file__": str(script_path),
-                "__cached__": None,
-                "__doc__": None,
-                "__loader__": None,
-                "__package__": None,
-                "__spec__": None,
-            },
-            source=script_path,
-        )
+    def load_lines(self):
+        linecache.updatecache(self.module.__file__, self.module.__dict__)
 
-    @classmethod
-    def from_module(cls, module: Any):
-        return cls(
-            module_path=Path(module.__file__).resolve(),
-            module_name=module.__name__,
-            module_globals=module.__dict__,
-            source=module,
-        )
-
-
-class REPL:
-    def __init__(self, reloader_or_source: Reloader | Path | ModuleType):
-        self.observer = Observer()
-        self.handler = DebounceFileEventHandler()
-        self.reloader = self.watch(reloader_or_source)
-        self.executed = False
-
-    def watch(self, reloader_or_source: Reloader | Path | ModuleType) -> Reloader:
-        if isinstance(reloader_or_source, Reloader):
-            reloader = reloader_or_source
-        elif isinstance(reloader_or_source, Path):
-            path = reloader_or_source
-            reloader = Reloader.from_script(path)
-        elif isinstance(reloader_or_source, ModuleType):
-            module = reloader_or_source
-            reloader = Reloader.from_module(module)
+        if self.module.__loader__:
+            return inspect.getsourcelines(self.module)[0]
         else:
-            raise TypeError(f"unsupported type: {type(reloader_or_source)}")
+            return Path(self.module.__file__).read_text().splitlines(keepends=True)
 
-        self.handler.add(reloader.module_path, reloader)
-        return reloader
+    def load_chunks(self):
+        lines = self.load_lines()
+        source = "".join(lines)
+        tree = ast.parse(source)
+
+        chunks = []
+        for node in tree.body:
+            lineno, end_lineno = get_linenos(node)
+            code = "".join(lines[lineno - 1 : end_lineno])
+            chunks.append(Chunk(node, code, self.module.__file__))
+
+        return chunks
+
+    @classmethod
+    def from_script(cls, script_path: Path | PathLike):
+        script_module = cls.create_script_module(script_path)
+        return cls(script_module, module_is_script=True)
+
+    @classmethod
+    def create_script_module(cls, script_path: Path | PathLike) -> ModuleType:
+        script_path = Path(script_path).resolve()
+        script_module = ModuleType("__main__")
+        script_module.__file__ = str(script_path)
+        script_module.__cached__ = None
+        script_module.__package__ = None
+        return script_module
+
+
+class SysModulesWatcher(Thread):
+    def __init__(
+        self,
+        check: Callable[[ModuleType], bool],
+        callback: Callable[[ModuleType], None],
+    ):
+        self.watched = set()
+        self.ignored = set()
+        self.check = check
+        self.callback = callback
+        self.running = None
+        super().__init__(name=type(self).__name__, daemon=True)
+
+    def start(self):
+        self.watch_all()
+        self.running = True
+        super().start()
 
     def run(self):
-        self.handler.schedule(self.observer)
-        self.observer.start()
+        while self.running:
+            self.watch_all()
+            sleep(1)
 
-        while True:
-            reloader = self.handler.wait()
-            reloader.step()
+    def stop(self):
+        self.running = False
 
-            if reloader is not self.reloader:
-                self.reloader.step()
+    def watch_all(self):
+        module_names = list(sys.modules)
+        modified_names = set(module_names) - self.watched - self.ignored
+        if not modified_names:
+            return
+
+        for module_name in reversed(module_names):
+            if module_name not in modified_names:
+                continue
+
+            if module_name == "script":
+                module = sys.modules[module_name]
+                print(module_name, self.check(module))
+
+            module = sys.modules[module_name]
+            if self.check(module):
+                self.watched.add(module_name)
+                self.callback(module)
+            else:
+                self.ignored.add(module_name)
+
+
+class AutoReloader:
+    CURRENT_INSTANCE: ClassVar[ContextVar] = ContextVar("AutoReloader.CURRENT_INSTANCE")
+
+    def __init__(self, script_path: Path | PathLike = None):
+        self.sys_modules_watcher = SysModulesWatcher(
+            check=self._check_module,
+            callback=self.watch_module,
+        )
+        self.watchdog_observer = Observer()
+        self.watchdog_handler = DebounceFileSystemEventHandler(self.watchdog_observer)
+        self.script_reloader: Reloader | None = None
+        self.script_debouncer = Debouncer()
+        if script_path is not None:
+            self.watch_script(script_path)
+
+    @classmethod
+    def get_instance(cls) -> "AutoReloader":
+        try:
+            return cls.CURRENT_INSTANCE.get()
+        except LookupError as e:
+            raise RuntimeError("AutoReloader is not running") from e
+
+    @staticmethod
+    def _check_module(module: ModuleType):
+        loader = getattr(module, "__loader__", None)
+        try:
+            if not loader or not loader.get_source(module.__name__):
+                raise ValueError("no source available")
+        except (ImportError, TypeError, ValueError):
+            return False
+        else:
+            return True
+
+    def watch_module(self, module: ModuleType) -> None:
+        reloader = Reloader(module)
+        self.watchdog_handler.add(module.__file__, reloader)
+
+    def watch_script(self, script_path: Path | PathLike):
+        self.script_reloader = Reloader.from_script(script_path)
+        self.watchdog_handler.add(
+            self.script_reloader.module.__file__,
+            self.script_reloader,
+        )
+        self.watchdog_handler.queue.put_nowait(self.script_reloader)
+
+    def run(self):
+        try:
+            self.CURRENT_INSTANCE.get()
+        except LookupError:
+            pass
+        else:
+            raise RuntimeError(f"{type(self).__name__} is already running")
+
+        current_instance_token = type(self).CURRENT_INSTANCE.set(self)
+
+        try:
+            self.watchdog_observer.start()
+            self.sys_modules_watcher.start()
+            self.script_debouncer()
+
+            while True:
+                reloader = self.watchdog_handler.wait()
+                self.reload(reloader)
+
+                if (
+                    self.script_reloader is not None
+                    and reloader is not self.script_reloader
+                    and self.script_debouncer()
+                ):
+                    self.reload(self.script_reloader)
+        finally:
+            with suppress(ValueError):
+                type(self).CURRENT_INSTANCE.reset(current_instance_token)
+
+            self.sys_modules_watcher.stop()
+            self.sys_modules_watcher.join()
+            self.watchdog_observer.stop()
+            self.watchdog_observer.join()
+
+    @staticmethod
+    def reload(reloader: Reloader):
+        try:
+            reloader.reload()
+        except Exception:  # noqa
+            traceback.print_exc()
 
 
 def main():
@@ -287,8 +369,10 @@ def main():
         print(__doc__.strip(), file=sys.stderr)
         sys.exit(2)
 
-    repl = REPL(Path(sys.argv[0]).resolve())
-    repl.run()
+    script_path = Path(sys.argv[0]).resolve()
+
+    auto_reloader = AutoReloader(script_path)
+    auto_reloader.run()
 
 
 if __name__ == "__main__":
