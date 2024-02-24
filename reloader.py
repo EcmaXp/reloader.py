@@ -21,14 +21,14 @@ from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread
 from time import monotonic, sleep
-from types import ModuleType
+from types import ModuleType, MemberDescriptorType
 from typing import Any, Callable, ClassVar, cast
 
 from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
@@ -136,6 +136,9 @@ class Patcher:
                 new_globals[key] = self.patch_object(old_value, new_value)
 
     def patch_object(self, old_value: Any, new_value: Any):
+        if isinstance(new_value, MemberDescriptorType):
+            # TypeError: descriptor '<new_member>' for '<old_class>' objects doesn't apply to a '<old_class>' object # noqa
+            return old_value
         if isinstance(old_value, type) and isinstance(new_value, type):
             return self.patch_class(old_value, new_value)
         elif callable(old_value) and callable(new_value):
