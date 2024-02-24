@@ -27,22 +27,9 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
-
-
-def get_linenos(node: ast.AST) -> tuple[int, int]:
-    lineno = float("inf")
-    end_lineno = float("-inf")
-
-    for child in ast.walk(node):
-        if hasattr(child, "lineno"):
-            lineno = min(lineno, child.lineno)
-        if hasattr(child, "end_lineno"):
-            end_lineno = max(end_lineno, child.end_lineno)
-
-    return lineno, end_lineno
 
 
 class Debouncer:
@@ -87,11 +74,13 @@ class DebounceFileSystemEventHandler[T]:
 
 
 class Chunk:
-    def __init__(self, node: ast.AST, code: str, filename: str):
-        self.node = node
+    def __init__(self, stmt: ast.stmt, code: str, filename: str):
+        self.stmt = stmt
         self.code = code
         self.filename = filename
-        self.lineno = node.lineno if hasattr(node, "lineno") else 0
+        self.lineno = stmt.lineno if hasattr(stmt, "lineno") else 0
+        self.padding = "\n" * (self.lineno - 1)
+        self.is_main = self.code.startswith("if __name__")
 
     def __hash__(self):
         return hash(self.code)
@@ -103,16 +92,30 @@ class Chunk:
         return NotImplemented
 
     @cache
-    def is_main(self):
-        return self.code.splitlines()[0].startswith("if __name__")
-
-    @cache
     def compile(self):
-        padding = "\n" * (self.lineno - 1)
-        return compile(padding + self.code, self.filename, "exec")
+        return compile(self.padding + self.code, self.filename, "exec")
 
     def exec(self, module_globals: dict):
         exec(self.compile(), module_globals, module_globals)
+
+    @staticmethod
+    def get_linenos(node: ast.stmt) -> tuple[int, int]:
+        lineno = float("inf")
+        end_lineno = float("-inf")
+
+        for child in ast.walk(node):
+            if hasattr(child, "lineno"):
+                lineno = min(lineno, child.lineno)
+            if hasattr(child, "end_lineno"):
+                end_lineno = max(end_lineno, child.end_lineno)
+
+        return lineno, end_lineno
+
+    @classmethod
+    def from_file(cls, node: ast.stmt, lines: list[str], file: str):
+        lineno, end_lineno = Chunk.get_linenos(node)
+        code = "".join(lines[lineno - 1 : end_lineno])
+        return cls(node, code, file)
 
 
 class Patcher:
@@ -179,7 +182,7 @@ class Reloader:
 
         self.executed_chunks = executed_chunks = []
         for chunk in found_chunks:
-            if chunk.is_main():
+            if chunk.is_main:
                 if with_main and self.module_is_script:
                     counter[chunk] -= 1
                     self.reload_chunk(chunk)
@@ -206,27 +209,22 @@ class Reloader:
         source = "".join(lines)
         tree = ast.parse(source)
 
-        chunks = []
-        for node in tree.body:
-            lineno, end_lineno = get_linenos(node)
-            code = "".join(lines[lineno - 1 : end_lineno])
-            chunks.append(Chunk(node, code, self.module.__file__))
-
-        return chunks
+        return [
+            Chunk.from_file(stmt, lines, self.module.__file__) for stmt in tree.body
+        ]
 
     @classmethod
     def from_script(cls, script_path: Path | PathLike):
-        script_module = cls.create_script_module(script_path)
-        return cls(script_module, module_is_script=True)
+        module = cls.create_script_module(script_path)
+        return cls(module, module_is_script=True)
 
     @classmethod
     def create_script_module(cls, script_path: Path | PathLike) -> ModuleType:
-        script_path = Path(script_path).resolve()
-        script_module = ModuleType("__main__")
-        script_module.__file__ = str(script_path)
-        script_module.__cached__ = None
-        script_module.__package__ = None
-        return script_module
+        module = ModuleType("__main__")
+        module.__file__ = str(Path(script_path).resolve())
+        module.__cached__ = None
+        module.__package__ = None
+        return module
 
 
 class SysModulesWatcher(Thread):
@@ -296,7 +294,7 @@ class AutoReloader(Thread):
         try:
             return cls.CURRENT_INSTANCE.get()
         except LookupError as e:
-            raise RuntimeError("AutoReloader is not running") from e
+            raise RuntimeError(f"{cls.__name__} is not running") from e
 
     @staticmethod
     def _check_module(module: ModuleType):
