@@ -9,6 +9,7 @@ import argparse
 import ast
 import inspect
 import linecache
+import subprocess
 import sys
 import traceback
 from collections import Counter
@@ -28,7 +29,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
@@ -354,8 +355,12 @@ class AutoReloader(Thread):
         except Empty:
             return
 
+        self.on_reload(reloader)
         self.reload(reloader)
         self.queue.task_done()
+
+    def on_reload(self, reloader: Reloader):
+        pass
 
     def stop(self):
         self.running = False
@@ -436,6 +441,7 @@ class DaemonReloader(AutoReloader):
 
 parser = argparse.ArgumentParser(description=__doc__.strip())
 parser.add_argument("--loop", action="store_true")
+parser.add_argument("--clear", action="store_true")
 parser.add_argument("script", type=Path)
 parser.add_argument("argv", nargs=argparse.REMAINDER)
 
@@ -447,6 +453,10 @@ def main():
 
     auto_reloader_cls = ScriptReloader if args.loop else DaemonReloader
     auto_reloader = auto_reloader_cls(script_path)
+
+    if args.clear:
+        auto_reloader.on_reload = lambda reloader: subprocess.call(["clear"])
+
     auto_reloader.execute()
 
 
