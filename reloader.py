@@ -16,7 +16,6 @@ from collections import Counter
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from ctypes import pythonapi, c_long, py_object
-from functools import cache
 from os import PathLike
 from pathlib import Path
 from queue import Queue, Empty
@@ -29,7 +28,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
@@ -82,48 +81,43 @@ class DebounceFileSystemEventHandler[T]:
 
 
 class Chunk:
-    def __init__(self, stmt: ast.stmt, code: str, filename: str):
+    def __init__(self, stmt: ast.stmt, source_code: str, filename: str):
         self.stmt = stmt
-        self.code = code
+        self.source_code = source_code
+        self.compiled_code = compile(ast.Module(body=[self.stmt]), filename, "exec")
         self.filename = filename
-        self.lineno = stmt.lineno if hasattr(stmt, "lineno") else 0
-        self.padding = "\n" * (self.lineno - 1)
-        self.is_main = self.code.startswith("if __name__")
+        self.is_main = self.source_code.startswith("if __name__")
+
+    @classmethod
+    def from_file(cls, stmt: ast.stmt, lines: list[str], file: str):
+        lineno, end_lineno = Chunk.get_linenos(stmt)
+        source_code = "".join(lines[lineno - 1 : end_lineno])
+        return cls(stmt, source_code, file)
 
     def __hash__(self):
-        return hash(self.code)
+        return hash(self.source_code)
 
     def __eq__(self, other):
         if isinstance(other, Chunk):
-            return self.code == other.code
+            return self.source_code == other.source_code
 
         return NotImplemented
 
-    @cache
-    def compile(self):
-        return compile(self.padding + self.code, self.filename, "exec")
-
     def exec(self, module_globals: dict):
-        exec(self.compile(), module_globals, module_globals)
+        exec(self.compiled_code, module_globals, module_globals)
 
     @staticmethod
-    def get_linenos(node: ast.stmt) -> tuple[int, int]:
+    def get_linenos(stmt: ast.stmt) -> tuple[int, int]:
         lineno = float("inf")
         end_lineno = float("-inf")
 
-        for child in ast.walk(node):
+        for child in ast.walk(stmt):
             if hasattr(child, "lineno"):
                 lineno = min(lineno, child.lineno)
             if hasattr(child, "end_lineno"):
                 end_lineno = max(end_lineno, child.end_lineno)
 
         return lineno, end_lineno
-
-    @classmethod
-    def from_file(cls, node: ast.stmt, lines: list[str], file: str):
-        lineno, end_lineno = Chunk.get_linenos(node)
-        code = "".join(lines[lineno - 1 : end_lineno])
-        return cls(node, code, file)
 
 
 class Patcher:
