@@ -22,15 +22,18 @@ from queue import Queue, Empty
 from threading import Thread
 from time import monotonic, sleep
 from types import ModuleType, MemberDescriptorType
-from typing import Any, Callable, ClassVar, cast
+from typing import Any, Callable, ClassVar, cast, Generic, TypeVar
 
 from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.4"
+__version__ = "0.8.5"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
+
+
+T = TypeVar("T")
 
 
 class InterruptExecution(BaseException):
@@ -51,7 +54,7 @@ class Debouncer:
         return True
 
 
-class DebounceFileSystemEventHandler[T]:
+class DebounceFileSystemEventHandler(Generic[T]):
     def __init__(self, observer: Observer, queue: Queue, interrupt: Callable[[], None]):
         self.observer = observer
         self.queue = queue
@@ -84,7 +87,9 @@ class Chunk:
     def __init__(self, stmt: ast.stmt, source_code: str, filename: str):
         self.stmt = stmt
         self.source_code = source_code
-        self.compiled_code = compile(ast.Module(body=[self.stmt]), filename, "exec")
+        self.compiled_code = compile(
+            ast.Module(body=[self.stmt], type_ignores=[]), filename, "exec"
+        )
         self.filename = filename
         self.is_main = self.source_code.startswith("if __name__")
 
@@ -215,7 +220,7 @@ class Reloader:
     def load_chunks(self):
         lines = self.load_lines()
         source = "".join(lines)
-        tree = ast.parse(source, self.module.__file__, type_comments=True)
+        tree = ast.parse(source, self.module.__file__)
 
         return [
             Chunk.from_file(stmt, lines, self.module.__file__) for stmt in tree.body
@@ -291,7 +296,7 @@ class AutoReloader(Thread):
             callback=cast(Callable[[ModuleType], None], self.watch_module),
         )
         self.watchdog_observer = Observer()
-        self.watchdog_handler = DebounceFileSystemEventHandler(
+        self.watchdog_handler = DebounceFileSystemEventHandler[Reloader](
             self.watchdog_observer,
             self.queue,
             self.interrupt,
