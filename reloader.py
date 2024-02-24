@@ -27,7 +27,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.9"
+__version__ = "0.8.10"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 
@@ -194,7 +194,7 @@ class Patcher:
             setattr(old_obj, key, self.patch_object(old_value, new_value))
 
 
-class Reloader:
+class ModuleReloader:
     def __init__(self, module: ModuleType, *, is_script: bool = False):
         self.module = module
         self.is_script = is_script
@@ -255,6 +255,16 @@ class Reloader:
         return module
 
 
+class ResourceReloader:
+    def __init__(self, path: Path | PathLike | str):
+        self.path = Path(path).resolve()
+        self.is_script = False
+
+    def reload(self, *, with_main: bool = True):
+        # ScriptAutoReloader will reload script
+        pass
+
+
 class SysModulesWatcher(Thread):
     def __init__(
         self,
@@ -312,19 +322,21 @@ class AutoReloader(Thread):
         super().__init__(name=type(self).__name__, daemon=daemon)
         self.running = False
         self.debounce_interval = debounce_interval
-        self.queue = Queue[Reloader]()
+        self.queue = Queue[ModuleReloader | ResourceReloader]()
         self.sys_modules_watcher = SysModulesWatcher(
             check=self._check_module,
             callback=cast(Callable[[ModuleType], None], self.watch_module),
         )
         self.watchdog_observer = Observer()
-        self.watchdog_handler = DebounceFileSystemEventHandler[Reloader](
+        self.watchdog_handler = DebounceFileSystemEventHandler[
+            ModuleReloader | ResourceReloader
+        ](
             observer=self.watchdog_observer,
             queue=self.queue,
             interrupt=self.interrupt,
             debounce_interval=self.debounce_interval,
         )
-        self.script_reloader: Reloader | None = None
+        self.script_reloader: ModuleReloader | None = None
         self.reload_with_main = reload_with_main
         self.interruptable = False
 
@@ -342,9 +354,14 @@ class AutoReloader(Thread):
         except (AttributeError, ImportError, TypeError):
             return False
 
-    def watch_module(self, module: ModuleType) -> Reloader:
-        reloader = Reloader(module)
+    def watch_module(self, module: ModuleType) -> ModuleReloader:
+        reloader = ModuleReloader(module)
         self.watchdog_handler.add(module.__file__, reloader)
+        return reloader
+
+    def watch_resource(self, path: Path | PathLike | str) -> ResourceReloader:
+        reloader = ResourceReloader(path)
+        self.watchdog_handler.add(path, reloader)
         return reloader
 
     def run(self):
@@ -384,13 +401,13 @@ class AutoReloader(Thread):
         self.reload(reloader)
         self.queue.task_done()
 
-    def on_reload(self, reloader: Reloader):
+    def on_reload(self, reloader: ModuleReloader | ResourceReloader):
         pass
 
     def stop(self):
         self.running = False
 
-    def reload(self, reloader: Reloader):
+    def reload(self, reloader: ModuleReloader | ResourceReloader):
         self.interruptable = self.reload_with_main and reloader.is_script
 
         try:
@@ -415,7 +432,7 @@ class AutoReloader(Thread):
         raise NotImplementedError
 
 
-class ScriptReloader(AutoReloader):
+class ScriptAutoReloader(AutoReloader):
     def __init__(
         self,
         script_path: Path | PathLike = None,
@@ -430,15 +447,15 @@ class ScriptReloader(AutoReloader):
         if script_path is not None:
             self.watch_script(script_path)
 
-    def watch_script(self, script_path: Path | PathLike) -> Reloader:
-        reloader = Reloader.from_script(script_path)
+    def watch_script(self, script_path: Path | PathLike) -> ModuleReloader:
+        reloader = ModuleReloader.from_script(script_path)
         self.watchdog_handler.add(reloader.module.__file__, reloader)
         self.queue.put(reloader)
         self.script_debouncer()
         self.script_reloader = reloader
         return reloader
 
-    def reload(self, reloader: Reloader):
+    def reload(self, reloader: ModuleReloader | ResourceReloader):
         super().reload(reloader)
 
         if (
@@ -453,7 +470,7 @@ class ScriptReloader(AutoReloader):
         self.join()
 
 
-class DaemonReloader(AutoReloader):
+class DaemonAutoReloader(AutoReloader):
     def __init__(
         self,
         script_path: Path | PathLike = None,
@@ -467,8 +484,8 @@ class DaemonReloader(AutoReloader):
         if script_path is not None:
             self.set_script(script_path)
 
-    def set_script(self, script_path: Path | PathLike) -> Reloader:
-        reloader = Reloader.from_script(script_path)
+    def set_script(self, script_path: Path | PathLike) -> ModuleReloader:
+        reloader = ModuleReloader.from_script(script_path)
         self.watchdog_handler.add(reloader.module.__file__, reloader)
         self.script_reloader = reloader
         return reloader
@@ -488,6 +505,13 @@ parser.add_argument(
     type=float,
     default=DEFAULT_DEBOUNCE_INTERVAL,
 )
+parser.add_argument(
+    "-f",
+    "--resource-file",
+    type=Path,
+    action="append",
+    default=[],
+)
 parser.add_argument("script", type=Path)
 parser.add_argument("argv", nargs=argparse.REMAINDER)
 
@@ -498,14 +522,20 @@ def clear():
 
 def main():
     args = parser.parse_args()
+    if not args.loop and args.resource_file:
+        parser.error("argument -f/--resource-file: --loop is required")
+
     script_path = args.script.resolve()
     sys.argv = [str(script_path), *args.argv]
 
-    auto_reloader_cls = ScriptReloader if args.loop else DaemonReloader
+    auto_reloader_cls = ScriptAutoReloader if args.loop else DaemonAutoReloader
     auto_reloader = auto_reloader_cls(
         script_path,
         debounce_interval=args.debounce_interval,
     )
+
+    for path in args.resource_file:
+        auto_reloader.watch_resource(path)
 
     if args.clear:
         auto_reloader.on_reload = lambda reloader: clear()
