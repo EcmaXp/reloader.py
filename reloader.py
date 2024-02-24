@@ -22,22 +22,26 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
 
 class ScriptFileEventHandler:
     def __init__(self):
-        self.src_paths = set()
+        self.paths = set()
         self.queue = Queue()
         self.interval = 0.1
         self.last = 0
 
+    @property
+    def parents(self):
+        return {str(Path(path).parent) for path in self.paths}
+
     def dispatch(self, event: FileSystemEvent):
         if event.event_type not in ("created", "modified"):
             return
-        if event.src_path not in self.src_paths:
+        if event.src_path not in self.paths:
             return
 
         now = monotonic()
@@ -48,7 +52,11 @@ class ScriptFileEventHandler:
         self.queue.put(True)
 
     def add(self, path: Path | PathLike | str | bytes):
-        self.src_paths.add(str(Path(path).resolve()))
+        self.paths.add(str(Path(path).resolve()))
+
+    def schedule(self, observer: Observer):
+        for parent in self.parents:
+            observer.schedule(self, str(parent))
 
     def wait(self) -> bool:
         return self.queue.get()
@@ -158,8 +166,6 @@ class ScriptFile:
             "__spec__": None,
         }
 
-        self.handler = ScriptFileEventHandler()
-        self.handler.add(self.path)
         self.patcher = Patcher(self.globals)
 
     def run(self):
@@ -182,25 +188,6 @@ class ScriptFile:
         tree = ast.parse(self.path.read_text())
         return Chunks(tree, str(self.path))
 
-    def loop(self):
-        observer = Observer()
-        observer.start()
-
-        self.observe(observer)
-        self.run()
-
-        while self.wait():
-            try:
-                self.reload()
-            except Exception:  # noqa
-                traceback.print_exc()
-
-    def observe(self, observer: Observer):
-        observer.schedule(self.handler, str(self.path.parent))
-
-    def wait(self) -> bool:
-        return self.handler.wait()
-
 
 def main():
     sys.argv.pop(0)
@@ -209,7 +196,20 @@ def main():
         sys.exit(2)
 
     script_file = ScriptFile(sys.argv[0])
-    script_file.loop()
+    script_file.run()
+
+    observer = Observer()
+    observer.start()
+
+    handler = ScriptFileEventHandler()
+    handler.add(script_file.path)
+    handler.schedule(observer)
+
+    while handler.wait():
+        try:
+            script_file.reload()
+        except Exception:  # noqa
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
