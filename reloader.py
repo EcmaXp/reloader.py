@@ -7,6 +7,7 @@ usage: python3 -m reloader script.py
 """
 
 import ast
+import inspect
 import sys
 import traceback
 from collections import Counter
@@ -16,13 +17,14 @@ from os import PathLike
 from pathlib import Path
 from queue import Queue
 from time import monotonic
+from types import ModuleType
 from typing import Any, Callable, Iterator
 
 from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
@@ -87,8 +89,8 @@ class Chunk:
         padding = "\n" * (self.lineno - 1)
         return compile(padding + self.code, self.filename, "exec")
 
-    def exec(self, mod_globals: dict):
-        exec(self.compile(), mod_globals, mod_globals)
+    def exec(self, module_globals: dict):
+        exec(self.compile(), module_globals, module_globals)
 
 
 class Chunks(Chunk):
@@ -100,10 +102,16 @@ class Chunks(Chunk):
     def __iter__(self) -> Iterator[Chunk]:
         return iter(self.chunks)
 
+    @classmethod
+    def from_path(cls, path: Path | PathLike | str | bytes):
+        path = Path(path).resolve()
+        tree = ast.parse(path.read_text())
+        return cls(tree, str(path))
+
 
 class Patcher:
-    def __init__(self, mod_globals: dict):
-        self.mod_globals = mod_globals
+    def __init__(self, module_globals: dict):
+        self.module_globals = module_globals
 
     def patch_module(self, old_globals: dict, new_globals: dict):
         for key, new_value in new_globals.items():
@@ -125,7 +133,14 @@ class Patcher:
 
     def patch_callable(self, old_callable: Callable, new_callable: Callable):
         self.patch_vars(old_callable, new_callable)
-        old_callable.__code__ = new_callable.__code__  # noqa
+
+        try:
+            old_callable.__code__ = new_callable.__code__  # noqa
+        except AttributeError:
+            old_func = inspect.unwrap(old_callable)
+            new_func = inspect.unwrap(new_callable)
+            old_func.__code__ = new_func.__code__  # noqa
+
         return old_callable
 
     def patch_vars(self, old_obj, new_obj):
@@ -138,41 +153,45 @@ class Patcher:
             setattr(old_obj, key, self.patch_object(old_value, new_value))
 
     @contextmanager
-    def patch(self, mod_globals: dict):
-        old_globals = mod_globals.copy()
+    def patch(self, module_globals: dict):
+        old_globals = module_globals.copy()
         try:
             yield
         finally:
-            self.patch_module(old_globals, mod_globals)
+            self.patch_module(old_globals, module_globals)
 
 
-class ScriptFile:
+class Reloader:
     def __init__(
         self,
-        path: Path | PathLike | str | bytes | None,
-        module_name: str = "__main__",
+        module_name: str,
+        module_path: Path | PathLike | str | bytes,
+        module_globals: dict,
+        source: Path | ModuleType,
     ):
-        self.path = Path(path).resolve()
         self.module_name = module_name
-        self.chunks = self._load()
+        self.module_path = Path(module_path).resolve()
+        self.globals = module_globals
+        self.chunks = None
+        self.patcher = Patcher(self.globals)
+        self.source = source
 
-        self.globals = {
-            "__name__": self.module_name,
-            "__file__": str(self.path),
-            "__cached__": None,
-            "__doc__": None,
-            "__loader__": None,
-            "__package__": None,
-            "__spec__": None,
-        }
-
+    def __post_init__(self):
+        self.chunks = Chunks.from_path(self.module_path)
         self.patcher = Patcher(self.globals)
 
     def run(self):
-        self.chunks.exec(self.globals)
+        if self.chunks is not None:
+            return
+
+        chunks = Chunks.from_path(self.module_path)
+        if isinstance(self.source, Path):
+            chunks.exec(self.globals)
+
+        self.chunks = chunks
 
     def reload(self) -> bool:
-        chunks = self._load()
+        chunks = Chunks.from_path(self.module_path)
         counter = Counter(chunks) - Counter(self.chunks)
         self.chunks = chunks
 
@@ -184,9 +203,81 @@ class ScriptFile:
 
         return True
 
-    def _load(self) -> Chunks:
-        tree = ast.parse(self.path.read_text())
-        return Chunks(tree, str(self.path))
+    @classmethod
+    def from_script(
+        cls,
+        script_path: Path | PathLike | str | bytes,
+        module_name: str = "__main__",
+    ):
+        script_path = Path(script_path).resolve()
+
+        return cls(
+            module_path=script_path,
+            module_name=module_name,
+            module_globals={
+                "__name__": module_name,
+                "__file__": str(script_path),
+                "__cached__": None,
+                "__doc__": None,
+                "__loader__": None,
+                "__package__": None,
+                "__spec__": None,
+            },
+            source=script_path,
+        )
+
+    @classmethod
+    def from_module(cls, module: Any):
+        return cls(
+            module_path=Path(module.__file__).resolve(),
+            module_name=module.__name__,
+            module_globals=module.__dict__,
+            source=module,
+        )
+
+
+class REPL:
+    def __init__(self, reloader: Reloader):
+        self.reloader = reloader
+        self.observer = Observer()
+        self.handler = ScriptFileEventHandler()
+        self.handler.add(self.reloader.module_path)
+        self.executed = False
+
+    def observe(self):
+        self.handler.schedule(self.observer)
+        self.observer.start()
+
+    def run(self):
+        self.step()
+        while self.handler.wait():
+            self.step()
+
+    def step(self):
+        if not self.executed:
+            return self.step_first()
+        else:
+            return self.step_next()
+
+    def step_first(self):
+        if self.executed:
+            return True
+
+        try:
+            self.reloader.run()
+            self.executed = True
+            return True
+        except Exception:  # noqa
+            traceback.print_exc()
+            return False
+
+    def step_next(self):
+        try:
+            self.reloader.reload()
+            return True
+        except Exception:  # noqa
+            traceback.print_exc()
+            return False
 
 
 def main():
@@ -195,21 +286,11 @@ def main():
         print(__doc__.strip(), file=sys.stderr)
         sys.exit(2)
 
-    script_file = ScriptFile(sys.argv[0])
-    script_file.run()
+    reloader = Reloader.from_script(sys.argv[0])
 
-    observer = Observer()
-    observer.start()
-
-    handler = ScriptFileEventHandler()
-    handler.add(script_file.path)
-    handler.schedule(observer)
-
-    while handler.wait():
-        try:
-            script_file.reload()
-        except Exception:  # noqa
-            traceback.print_exc()
+    repl = REPL(reloader)
+    repl.observe()
+    repl.run()
 
 
 if __name__ == "__main__":
