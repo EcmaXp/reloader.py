@@ -14,6 +14,7 @@ import traceback
 from collections import Counter
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from ctypes import pythonapi, c_long, py_object
 from functools import cache
 from os import PathLike
 from pathlib import Path
@@ -27,9 +28,13 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
+
+
+class InterruptExecution(BaseException):
+    pass
 
 
 class Debouncer:
@@ -47,12 +52,13 @@ class Debouncer:
 
 
 class DebounceFileSystemEventHandler[T]:
-    def __init__(self, observer: Observer, queue: Queue):
+    def __init__(self, observer: Observer, queue: Queue, interrupt: Callable[[], None]):
         self.observer = observer
         self.queue = queue
         self.parents = set()
         self.paths = {}
         self.debouncers = {}
+        self.interrupt = interrupt
 
     def dispatch(self, event: FileSystemEvent):
         if event.event_type in ("created", "modified"):
@@ -60,6 +66,7 @@ class DebounceFileSystemEventHandler[T]:
             obj = self.paths.get(path)
             if obj and self.debouncers[path]():
                 self.queue.put(obj)
+                self.interrupt()
 
     def add(self, path: Path | PathLike | str, obj: T):
         path = Path(path).resolve()
@@ -170,27 +177,30 @@ class Patcher:
 
 
 class Reloader:
-    def __init__(self, module: ModuleType, *, module_is_script: bool = False):
+    def __init__(self, module: ModuleType, *, is_script: bool = False):
         self.module = module
-        self.module_is_script = module_is_script
-        self.executed_chunks = [] if self.module_is_script else self.load_chunks()
+        self.is_script = is_script
+        self.passed_chunks = [] if self.is_script else self.load_chunks()
         self.patcher = Patcher()
 
-    def reload(self, *, with_main: bool = True):
-        found_chunks = self.load_chunks()
-        counter = Counter(found_chunks) - Counter(self.executed_chunks)
+    def iter_reloadable_chunks(self, *, with_main: bool = True):
+        chunks = self.load_chunks()
+        counter = Counter(chunks) - Counter(self.passed_chunks)
 
-        self.executed_chunks = executed_chunks = []
-        for chunk in found_chunks:
+        self.passed_chunks = passed_chunks = []
+        for chunk in chunks:
             if chunk.is_main:
-                if with_main and self.module_is_script:
-                    counter[chunk] -= 1
-                    self.reload_chunk(chunk)
+                if with_main and self.is_script:
+                    yield chunk
             elif counter[chunk] > 0:
-                counter[chunk] -= 1
-                self.reload_chunk(chunk)
+                yield chunk
 
-            executed_chunks.append(chunk)
+            counter[chunk] -= 1
+            passed_chunks.append(chunk)
+
+    def reload(self, *, with_main: bool = True):
+        for chunk in self.iter_reloadable_chunks(with_main=with_main):
+            self.reload_chunk(chunk)
 
     def reload_chunk(self, chunk: Chunk):
         with self.patcher.patch(self.module.__dict__):
@@ -216,7 +226,7 @@ class Reloader:
     @classmethod
     def from_script(cls, script_path: Path | PathLike):
         module = cls.create_script_module(script_path)
-        return cls(module, module_is_script=True)
+        return cls(module, is_script=True)
 
     @classmethod
     def create_script_module(cls, script_path: Path | PathLike) -> ModuleType:
@@ -284,10 +294,13 @@ class AutoReloader(Thread):
         )
         self.watchdog_observer = Observer()
         self.watchdog_handler = DebounceFileSystemEventHandler(
-            self.watchdog_observer, self.queue
+            self.watchdog_observer,
+            self.queue,
+            self.interrupt,
         )
         self.script_reloader: Reloader | None = None
         self.reload_with_main = reload_with_main
+        self.interruptable = False
 
     @classmethod
     def get_instance(cls) -> AutoReloader:
@@ -348,10 +361,25 @@ class AutoReloader(Thread):
         self.running = False
 
     def reload(self, reloader: Reloader):
+        self.interruptable = self.reload_with_main and reloader.is_script
+
         try:
             reloader.reload(with_main=self.reload_with_main)
+        except InterruptExecution:
+            pass
         except Exception:  # noqa
             traceback.print_exc()
+        finally:
+            self.interruptable = False
+
+    def interrupt(self):
+        if not self.interruptable:
+            return
+
+        pythonapi.PyThreadState_SetAsyncExc(
+            c_long(self.ident),
+            py_object(InterruptExecution),
+        )
 
     def execute(self):
         raise NotImplementedError
