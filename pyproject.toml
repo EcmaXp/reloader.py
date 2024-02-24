@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "reloader.py"
-version = "0.8.8"
+version = "0.8.9"
 description = "A simple script reloader"
 license = "MIT"
 authors = ["EcmaXp <ecmaxp@ecmaxp.kr>"]

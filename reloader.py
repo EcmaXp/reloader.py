@@ -27,12 +27,14 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.8"
+__version__ = "0.8.9"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 
 
 T = TypeVar("T")
+
+DEFAULT_DEBOUNCE_INTERVAL = 0.1
 
 
 class InterruptExecution(BaseException):
@@ -40,7 +42,7 @@ class InterruptExecution(BaseException):
 
 
 class Debouncer:
-    def __init__(self, interval: float = 0.1):
+    def __init__(self, interval: float = DEFAULT_DEBOUNCE_INTERVAL):
         self.interval = interval
         self.last = 0
 
@@ -54,13 +56,21 @@ class Debouncer:
 
 
 class DebounceFileSystemEventHandler(Generic[T]):
-    def __init__(self, observer: Observer, queue: Queue, interrupt: Callable[[], None]):
+    def __init__(
+        self,
+        observer: Observer,
+        queue: Queue,
+        interrupt: Callable[[], None],
+        *,
+        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
+    ):
         self.observer = observer
         self.queue = queue
         self.parents = set()
         self.paths = {}
-        self.debouncers = {}
         self.interrupt = interrupt
+        self.debouncers = {}
+        self.debounce_interval = debounce_interval
 
     def dispatch(self, event: FileSystemEvent):
         if event.event_type in ("created", "modified"):
@@ -75,7 +85,7 @@ class DebounceFileSystemEventHandler(Generic[T]):
         parent = path.parent
 
         self.paths[path] = obj
-        self.debouncers[path] = Debouncer()
+        self.debouncers[path] = Debouncer(interval=self.debounce_interval)
 
         if parent not in self.parents:
             self.parents.add(parent)
@@ -292,9 +302,16 @@ class SysModulesWatcher(Thread):
 class AutoReloader(Thread):
     CURRENT_INSTANCE: ClassVar[ContextVar] = ContextVar("AutoReloader.CURRENT_INSTANCE")
 
-    def __init__(self, *, reload_with_main: bool, daemon: bool):
+    def __init__(
+        self,
+        *,
+        reload_with_main: bool,
+        daemon: bool,
+        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
+    ):
         super().__init__(name=type(self).__name__, daemon=daemon)
         self.running = False
+        self.debounce_interval = debounce_interval
         self.queue = Queue[Reloader]()
         self.sys_modules_watcher = SysModulesWatcher(
             check=self._check_module,
@@ -302,9 +319,10 @@ class AutoReloader(Thread):
         )
         self.watchdog_observer = Observer()
         self.watchdog_handler = DebounceFileSystemEventHandler[Reloader](
-            self.watchdog_observer,
-            self.queue,
-            self.interrupt,
+            observer=self.watchdog_observer,
+            queue=self.queue,
+            interrupt=self.interrupt,
+            debounce_interval=self.debounce_interval,
         )
         self.script_reloader: Reloader | None = None
         self.reload_with_main = reload_with_main
@@ -398,9 +416,17 @@ class AutoReloader(Thread):
 
 
 class ScriptReloader(AutoReloader):
-    def __init__(self, script_path: Path | PathLike = None):
-        super().__init__(reload_with_main=True, daemon=False)
-        self.script_debouncer = Debouncer()
+    def __init__(
+        self,
+        script_path: Path | PathLike = None,
+        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
+    ):
+        super().__init__(
+            reload_with_main=True,
+            daemon=False,
+            debounce_interval=debounce_interval,
+        )
+        self.script_debouncer = Debouncer(interval=self.debounce_interval)
         if script_path is not None:
             self.watch_script(script_path)
 
@@ -428,8 +454,16 @@ class ScriptReloader(AutoReloader):
 
 
 class DaemonReloader(AutoReloader):
-    def __init__(self, script_path: Path | PathLike = None):
-        super().__init__(reload_with_main=False, daemon=True)
+    def __init__(
+        self,
+        script_path: Path | PathLike = None,
+        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
+    ):
+        super().__init__(
+            reload_with_main=False,
+            daemon=True,
+            debounce_interval=debounce_interval,
+        )
         if script_path is not None:
             self.set_script(script_path)
 
@@ -449,6 +483,11 @@ class DaemonReloader(AutoReloader):
 parser = argparse.ArgumentParser(description=__doc__.strip())
 parser.add_argument("--loop", action="store_true")
 parser.add_argument("--clear", action="store_true")
+parser.add_argument(
+    "--debounce-interval",
+    type=float,
+    default=DEFAULT_DEBOUNCE_INTERVAL,
+)
 parser.add_argument("script", type=Path)
 parser.add_argument("argv", nargs=argparse.REMAINDER)
 
@@ -463,7 +502,10 @@ def main():
     sys.argv = [str(script_path), *args.argv]
 
     auto_reloader_cls = ScriptReloader if args.loop else DaemonReloader
-    auto_reloader = auto_reloader_cls(script_path)
+    auto_reloader = auto_reloader_cls(
+        script_path,
+        debounce_interval=args.debounce_interval,
+    )
 
     if args.clear:
         auto_reloader.on_reload = lambda reloader: clear()
