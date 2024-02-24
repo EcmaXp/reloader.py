@@ -28,7 +28,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.3"
+__version__ = "0.8.4"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
@@ -215,7 +215,7 @@ class Reloader:
     def load_chunks(self):
         lines = self.load_lines()
         source = "".join(lines)
-        tree = ast.parse(source)
+        tree = ast.parse(source, self.module.__file__, type_comments=True)
 
         return [
             Chunk.from_file(stmt, lines, self.module.__file__) for stmt in tree.body
