@@ -10,6 +10,7 @@ import ast
 import sys
 import traceback
 from collections import Counter
+from contextlib import contextmanager
 from functools import cache
 from os import PathLike
 from pathlib import Path
@@ -21,7 +22,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
@@ -92,49 +93,15 @@ class Chunks(Chunk):
         return iter(self.chunks)
 
 
-class ScriptFile:
-    def __init__(
-        self,
-        path: Path | PathLike | str | bytes | None,
-        module_name: str = "__main__",
-    ):
-        self.path = Path(path).resolve()
-        self.handler = ScriptFileEventHandler()
-        self.handler.add(self.path)
-        self.chunks = self._load()
+class Patcher:
+    def __init__(self, mod_globals: dict):
+        self.mod_globals = mod_globals
 
-        self.globals = dict(
-            __name__=module_name,
-            __file__=str(self.path),
-            __cached__=None,
-            __doc__=None,
-            __loader__=None,
-            __package__=None,
-            __spec__=None,
-        )
-
-    def run(self):
-        self.chunks.exec(self.globals)
-
-    def reload(self) -> bool:
-        chunks = self._load()
-        counter = Counter(chunks) - Counter(self.chunks)
-        self.chunks = chunks
-
-        for chunk in self.chunks:
-            if counter[chunk] > 0 or chunk.is_main():
-                counter[chunk] -= 1
-                old_globals = self.globals.copy()
-                chunk.exec(self.globals)
-                self.patch_module(old_globals)
-
-        return True
-
-    def patch_module(self, old_globals: dict):
-        for key, new_value in self.globals.items():
+    def patch_module(self, old_globals: dict, new_globals: dict):
+        for key, new_value in new_globals.items():
             old_value = old_globals.get(key)
             if old_value is not new_value:
-                self.globals[key] = self.patch_object(old_value, new_value)
+                new_globals[key] = self.patch_object(old_value, new_value)
 
     def patch_object(self, old_value: Any, new_value: Any):
         if isinstance(old_value, type) and isinstance(new_value, type):
@@ -161,6 +128,55 @@ class ScriptFile:
                 continue
 
             setattr(old_obj, key, self.patch_object(old_value, new_value))
+
+    @contextmanager
+    def patch(self, mod_globals: dict):
+        old_globals = mod_globals.copy()
+        try:
+            yield
+        finally:
+            self.patch_module(old_globals, mod_globals)
+
+
+class ScriptFile:
+    def __init__(
+        self,
+        path: Path | PathLike | str | bytes | None,
+        module_name: str = "__main__",
+    ):
+        self.path = Path(path).resolve()
+        self.module_name = module_name
+        self.chunks = self._load()
+
+        self.globals = {
+            "__name__": self.module_name,
+            "__file__": str(self.path),
+            "__cached__": None,
+            "__doc__": None,
+            "__loader__": None,
+            "__package__": None,
+            "__spec__": None,
+        }
+
+        self.handler = ScriptFileEventHandler()
+        self.handler.add(self.path)
+        self.patcher = Patcher(self.globals)
+
+    def run(self):
+        self.chunks.exec(self.globals)
+
+    def reload(self) -> bool:
+        chunks = self._load()
+        counter = Counter(chunks) - Counter(self.chunks)
+        self.chunks = chunks
+
+        for chunk in self.chunks:
+            if counter[chunk] > 0 or chunk.is_main():
+                counter[chunk] -= 1
+                with self.patcher.patch(self.globals):
+                    chunk.exec(self.globals)
+
+        return True
 
     def _load(self) -> Chunks:
         tree = ast.parse(self.path.read_text())
