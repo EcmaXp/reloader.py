@@ -28,9 +28,9 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.6"
-__license__ = "The MIT License"
-__url__ = "https://github.com/EcmaXp/reloader.py"
+__version__ = "0.8.7"
+__license__ = "MIT"
+__url__ = "https://pypi.org/project/reloader.py/"
 
 
 T = TypeVar("T")
