@@ -2,10 +2,10 @@
 """
 reloader.py - A simple script reloader
 inspired by jurigged[develoop] and watchdog
-
-usage: python3 -m reloader script.py
 """
+from __future__ import annotations
 
+import argparse
 import ast
 import inspect
 import linecache
@@ -17,17 +17,17 @@ from contextvars import ContextVar
 from functools import cache
 from os import PathLike
 from pathlib import Path
-from queue import Queue
+from queue import Queue, Empty
 from threading import Thread
 from time import monotonic, sleep
 from types import ModuleType
-from typing import Any, Callable, ClassVar
+from typing import Any, Callable, ClassVar, cast
 
 from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
@@ -60,9 +60,9 @@ class Debouncer:
 
 
 class DebounceFileSystemEventHandler[T]:
-    def __init__(self, observer: Observer):
+    def __init__(self, observer: Observer, queue: Queue):
         self.observer = observer
-        self.queue = Queue()
+        self.queue = queue
         self.parents = set()
         self.paths = {}
         self.debouncers = {}
@@ -84,9 +84,6 @@ class DebounceFileSystemEventHandler[T]:
         if parent not in self.parents:
             self.parents.add(parent)
             self.observer.schedule(self, str(parent))
-
-    def wait(self) -> T:
-        return self.queue.get()
 
 
 class Chunk:
@@ -176,21 +173,25 @@ class Reloader:
         self.executed_chunks = [] if self.module_is_script else self.load_chunks()
         self.patcher = Patcher()
 
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self.module!r}, is_script={self.module_is_script!r})"
-
-    def reload(self):
+    def reload(self, *, with_main: bool = True):
         found_chunks = self.load_chunks()
         counter = Counter(found_chunks) - Counter(self.executed_chunks)
 
-        self.executed_chunks = []
+        self.executed_chunks = executed_chunks = []
         for chunk in found_chunks:
-            if counter[chunk] > 0 or (self.module_is_script and chunk.is_main()):
+            if chunk.is_main():
+                if with_main and self.module_is_script:
+                    counter[chunk] -= 1
+                    self.reload_chunk(chunk)
+            elif counter[chunk] > 0:
                 counter[chunk] -= 1
-                with self.patcher.patch(self.module.__dict__):
-                    chunk.exec(self.module.__dict__)
+                self.reload_chunk(chunk)
 
-            self.executed_chunks.append(chunk)
+            executed_chunks.append(chunk)
+
+    def reload_chunk(self, chunk: Chunk):
+        with self.patcher.patch(self.module.__dict__):
+            chunk.exec(self.module.__dict__)
 
     def load_lines(self):
         linecache.updatecache(self.module.__file__, self.module.__dict__)
@@ -264,10 +265,6 @@ class SysModulesWatcher(Thread):
             if module_name not in modified_names:
                 continue
 
-            if module_name == "script":
-                module = sys.modules[module_name]
-                print(module_name, self.check(module))
-
             module = sys.modules[module_name]
             if self.check(module):
                 self.watched.add(module_name)
@@ -276,23 +273,26 @@ class SysModulesWatcher(Thread):
                 self.ignored.add(module_name)
 
 
-class AutoReloader:
+class AutoReloader(Thread):
     CURRENT_INSTANCE: ClassVar[ContextVar] = ContextVar("AutoReloader.CURRENT_INSTANCE")
 
-    def __init__(self, script_path: Path | PathLike = None):
+    def __init__(self, *, reload_with_main: bool, daemon: bool):
+        super().__init__(name=type(self).__name__, daemon=daemon)
+        self.running = False
+        self.queue = Queue[Reloader]()
         self.sys_modules_watcher = SysModulesWatcher(
             check=self._check_module,
-            callback=self.watch_module,
+            callback=cast(Callable[[ModuleType], None], self.watch_module),
         )
         self.watchdog_observer = Observer()
-        self.watchdog_handler = DebounceFileSystemEventHandler(self.watchdog_observer)
+        self.watchdog_handler = DebounceFileSystemEventHandler(
+            self.watchdog_observer, self.queue
+        )
         self.script_reloader: Reloader | None = None
-        self.script_debouncer = Debouncer()
-        if script_path is not None:
-            self.watch_script(script_path)
+        self.reload_with_main = reload_with_main
 
     @classmethod
-    def get_instance(cls) -> "AutoReloader":
+    def get_instance(cls) -> AutoReloader:
         try:
             return cls.CURRENT_INSTANCE.get()
         except LookupError as e:
@@ -300,26 +300,15 @@ class AutoReloader:
 
     @staticmethod
     def _check_module(module: ModuleType):
-        loader = getattr(module, "__loader__", None)
         try:
-            if not loader or not loader.get_source(module.__name__):
-                raise ValueError("no source available")
-        except (ImportError, TypeError, ValueError):
+            return bool(module.__loader__.get_source(module.__name__))  # noqa
+        except (AttributeError, ImportError, TypeError):
             return False
-        else:
-            return True
 
-    def watch_module(self, module: ModuleType) -> None:
+    def watch_module(self, module: ModuleType) -> Reloader:
         reloader = Reloader(module)
         self.watchdog_handler.add(module.__file__, reloader)
-
-    def watch_script(self, script_path: Path | PathLike):
-        self.script_reloader = Reloader.from_script(script_path)
-        self.watchdog_handler.add(
-            self.script_reloader.module.__file__,
-            self.script_reloader,
-        )
-        self.watchdog_handler.queue.put_nowait(self.script_reloader)
+        return reloader
 
     def run(self):
         try:
@@ -329,50 +318,110 @@ class AutoReloader:
         else:
             raise RuntimeError(f"{type(self).__name__} is already running")
 
+        threads = [self.watchdog_observer, self.sys_modules_watcher]
         current_instance_token = type(self).CURRENT_INSTANCE.set(self)
+        self.running = True
 
         try:
-            self.watchdog_observer.start()
-            self.sys_modules_watcher.start()
-            self.script_debouncer()
+            for thread in threads:
+                thread.start()
 
-            while True:
-                reloader = self.watchdog_handler.wait()
-                self.reload(reloader)
-
-                if (
-                    self.script_reloader is not None
-                    and reloader is not self.script_reloader
-                    and self.script_debouncer()
-                ):
-                    self.reload(self.script_reloader)
+            while self.running:
+                self.tick()
         finally:
             with suppress(ValueError):
                 type(self).CURRENT_INSTANCE.reset(current_instance_token)
 
-            self.sys_modules_watcher.stop()
-            self.sys_modules_watcher.join()
-            self.watchdog_observer.stop()
-            self.watchdog_observer.join()
+            self.running = False
+            for thread in threads:
+                thread.stop()
+                thread.join()
 
-    @staticmethod
-    def reload(reloader: Reloader):
+    def tick(self):
         try:
-            reloader.reload()
+            reloader = self.queue.get(timeout=1)
+        except Empty:
+            return
+
+        self.reload(reloader)
+        self.queue.task_done()
+
+    def stop(self):
+        self.running = False
+
+    def reload(self, reloader: Reloader):
+        try:
+            reloader.reload(with_main=self.reload_with_main)
         except Exception:  # noqa
             traceback.print_exc()
 
+    def execute(self):
+        raise NotImplementedError
+
+
+class ScriptReloader(AutoReloader):
+    def __init__(self, script_path: Path | PathLike = None):
+        super().__init__(reload_with_main=True, daemon=False)
+        self.script_debouncer = Debouncer()
+        if script_path is not None:
+            self.watch_script(script_path)
+
+    def watch_script(self, script_path: Path | PathLike) -> Reloader:
+        reloader = Reloader.from_script(script_path)
+        self.watchdog_handler.add(reloader.module.__file__, reloader)
+        self.queue.put(reloader)
+        self.script_debouncer()
+        self.script_reloader = reloader
+        return reloader
+
+    def reload(self, reloader: Reloader):
+        super().reload(reloader)
+
+        if (
+            self.script_reloader is not None
+            and reloader is not self.script_reloader
+            and self.script_debouncer()
+        ):
+            super().reload(self.script_reloader)
+
+    def execute(self):
+        self.start()
+        self.join()
+
+
+class DaemonReloader(AutoReloader):
+    def __init__(self, script_path: Path | PathLike = None):
+        super().__init__(reload_with_main=False, daemon=True)
+        if script_path is not None:
+            self.set_script(script_path)
+
+    def set_script(self, script_path: Path | PathLike) -> Reloader:
+        reloader = Reloader.from_script(script_path)
+        self.watchdog_handler.add(reloader.module.__file__, reloader)
+        self.script_reloader = reloader
+        return reloader
+
+    def execute(self):
+        self.start()
+        self.script_reloader.reload(with_main=True)
+        self.stop()
+        self.join()
+
+
+parser = argparse.ArgumentParser(description=__doc__.strip())
+parser.add_argument("--loop", action="store_true")
+parser.add_argument("script", type=Path)
+parser.add_argument("argv", nargs=argparse.REMAINDER)
+
 
 def main():
-    sys.argv.pop(0)
-    if not sys.argv:
-        print(__doc__.strip(), file=sys.stderr)
-        sys.exit(2)
+    args = parser.parse_args()
+    script_path = args.script.resolve()
+    sys.argv = [str(script_path), *args.argv]
 
-    script_path = Path(sys.argv[0]).resolve()
-
-    auto_reloader = AutoReloader(script_path)
-    auto_reloader.run()
+    auto_reloader_cls = ScriptReloader if args.loop else DaemonReloader
+    auto_reloader = auto_reloader_cls(script_path)
+    auto_reloader.execute()
 
 
 if __name__ == "__main__":
