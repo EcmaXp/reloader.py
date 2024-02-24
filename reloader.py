@@ -28,7 +28,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.5"
+__version__ = "0.8.6"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
@@ -161,7 +161,13 @@ class Patcher:
         old_func = inspect.unwrap(old_callable)
         new_func = inspect.unwrap(new_callable)
 
-        for name in ("__code__", "__annotations__", "__kwdefaults__", "__defaults__"):
+        for name in (
+            "__code__",
+            "__doc__",
+            "__annotations__",
+            "__kwdefaults__",
+            "__defaults__",
+        ):
             if hasattr(new_callable, name):
                 setattr(old_callable, name, getattr(new_callable, name))
             elif hasattr(new_func, name):
