@@ -9,7 +9,6 @@ usage: python3 -m reloader script.py
 import ast
 import inspect
 import sys
-import traceback
 from collections import Counter
 from contextlib import contextmanager
 from functools import cache
@@ -24,17 +23,17 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __license__ = "The MIT License"
 __url__ = "https://github.com/EcmaXp/reloader.py"
 
 
-class ScriptFileEventHandler:
+class DebounceFileEventHandler[T]:
     def __init__(self):
-        self.paths = set()
         self.queue = Queue()
         self.interval = 0.1
-        self.last = 0
+        self.paths = {}
+        self.lasts = {}
 
     @property
     def parents(self):
@@ -43,24 +42,30 @@ class ScriptFileEventHandler:
     def dispatch(self, event: FileSystemEvent):
         if event.event_type not in ("created", "modified"):
             return
-        if event.src_path not in self.paths:
+
+        path = event.src_path
+        obj = self.paths.get(path)
+        if not obj:
             return
 
         now = monotonic()
-        if now - self.last < self.interval:
+        if now - self.lasts[path] < self.interval:
             return
 
-        self.last = now
-        self.queue.put(True)
+        self.lasts[path] = now
+        self.queue.put(obj)
 
-    def add(self, path: Path | PathLike | str | bytes):
-        self.paths.add(str(Path(path).resolve()))
+    def add(self, path: Path | PathLike | str | bytes, obj: T):
+        path = str(Path(path).resolve())
+        self.paths[path] = obj
+        self.lasts[path] = 0
+        self.queue.put_nowait(obj)
 
     def schedule(self, observer: Observer):
         for parent in self.parents:
             observer.schedule(self, str(parent))
 
-    def wait(self) -> bool:
+    def wait(self) -> T:
         return self.queue.get()
 
 
@@ -180,6 +185,12 @@ class Reloader:
         self.chunks = Chunks.from_path(self.module_path)
         self.patcher = Patcher(self.globals)
 
+    def step(self):
+        if self.chunks is None:
+            self.run()
+        else:
+            self.reload()
+
     def run(self):
         if self.chunks is not None:
             return
@@ -190,18 +201,18 @@ class Reloader:
 
         self.chunks = chunks
 
-    def reload(self) -> bool:
+    def reload(self):
         chunks = Chunks.from_path(self.module_path)
         counter = Counter(chunks) - Counter(self.chunks)
         self.chunks = chunks
 
         for chunk in self.chunks:
-            if counter[chunk] > 0 or chunk.is_main():
+            if counter[chunk] > 0 or (
+                not isinstance(self.source, ModuleType) and chunk.is_main()
+            ):
                 counter[chunk] -= 1
                 with self.patcher.patch(self.globals):
                     chunk.exec(self.globals)
-
-        return True
 
     @classmethod
     def from_script(
@@ -237,47 +248,37 @@ class Reloader:
 
 
 class REPL:
-    def __init__(self, reloader: Reloader):
-        self.reloader = reloader
+    def __init__(self, reloader_or_source: Reloader | Path | ModuleType):
         self.observer = Observer()
-        self.handler = ScriptFileEventHandler()
-        self.handler.add(self.reloader.module_path)
+        self.handler = DebounceFileEventHandler()
+        self.reloader = self.watch(reloader_or_source)
         self.executed = False
 
-    def observe(self):
+    def watch(self, reloader_or_source: Reloader | Path | ModuleType) -> Reloader:
+        if isinstance(reloader_or_source, Reloader):
+            reloader = reloader_or_source
+        elif isinstance(reloader_or_source, Path):
+            path = reloader_or_source
+            reloader = Reloader.from_script(path)
+        elif isinstance(reloader_or_source, ModuleType):
+            module = reloader_or_source
+            reloader = Reloader.from_module(module)
+        else:
+            raise TypeError(f"unsupported type: {type(reloader_or_source)}")
+
+        self.handler.add(reloader.module_path, reloader)
+        return reloader
+
+    def run(self):
         self.handler.schedule(self.observer)
         self.observer.start()
 
-    def run(self):
-        self.step()
-        while self.handler.wait():
-            self.step()
+        while True:
+            reloader = self.handler.wait()
+            reloader.step()
 
-    def step(self):
-        if not self.executed:
-            return self.step_first()
-        else:
-            return self.step_next()
-
-    def step_first(self):
-        if self.executed:
-            return True
-
-        try:
-            self.reloader.run()
-            self.executed = True
-            return True
-        except Exception:  # noqa
-            traceback.print_exc()
-            return False
-
-    def step_next(self):
-        try:
-            self.reloader.reload()
-            return True
-        except Exception:  # noqa
-            traceback.print_exc()
-            return False
+            if reloader is not self.reloader:
+                self.reloader.step()
 
 
 def main():
@@ -286,10 +287,7 @@ def main():
         print(__doc__.strip(), file=sys.stderr)
         sys.exit(2)
 
-    reloader = Reloader.from_script(sys.argv[0])
-
-    repl = REPL(reloader)
-    repl.observe()
+    repl = REPL(Path(sys.argv[0]).resolve())
     repl.run()
 
 
