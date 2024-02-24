@@ -1,13 +1,11 @@
 [tool.poetry]
 name = "reloader.py"
-version = "0.8.7"
+version = "0.8.8"
 description = "A simple script reloader"
 license = "MIT"
 authors = ["EcmaXp <ecmaxp@ecmaxp.kr>"]
 repository = "https://github.com/EcmaXp/reloader.py"
-packages = [
-    {include = "reloader.py"},
-]
+packages = [{ include = "reloader.py" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

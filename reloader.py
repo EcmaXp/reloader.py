@@ -9,7 +9,6 @@ import argparse
 import ast
 import inspect
 import linecache
-import subprocess
 import sys
 import traceback
 from collections import Counter
@@ -28,7 +27,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.7"
+__version__ = "0.8.8"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 
@@ -454,6 +453,10 @@ parser.add_argument("script", type=Path)
 parser.add_argument("argv", nargs=argparse.REMAINDER)
 
 
+def clear():
+    print(end="\x1b[2J\x1b[H", flush=True)
+
+
 def main():
     args = parser.parse_args()
     script_path = args.script.resolve()
@@ -463,7 +466,7 @@ def main():
     auto_reloader = auto_reloader_cls(script_path)
 
     if args.clear:
-        auto_reloader.on_reload = lambda reloader: subprocess.call(["clear"])
+        auto_reloader.on_reload = lambda reloader: clear()
 
     auto_reloader.execute()
 
