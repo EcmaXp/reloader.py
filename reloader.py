@@ -27,7 +27,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.10"
+__version__ = "0.8.11"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 
@@ -498,8 +498,8 @@ class DaemonAutoReloader(AutoReloader):
 
 
 parser = argparse.ArgumentParser(description=__doc__.strip())
-parser.add_argument("--loop", action="store_true")
-parser.add_argument("--clear", action="store_true")
+parser.add_argument("--loop", "-l", action="store_true")
+parser.add_argument("--clear", "-c", action="store_true")
 parser.add_argument(
     "--debounce-interval",
     type=float,
@@ -527,6 +527,8 @@ def main():
 
     script_path = args.script.resolve()
     sys.argv = [str(script_path), *args.argv]
+
+    sys.path.insert(0, ".")
 
     auto_reloader_cls = ScriptAutoReloader if args.loop else DaemonAutoReloader
     auto_reloader = auto_reloader_cls(
