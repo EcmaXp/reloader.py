@@ -10,6 +10,7 @@ import ast
 import inspect
 import linecache
 import sys
+import threading
 import traceback
 from collections import Counter
 from contextlib import contextmanager, suppress
@@ -27,7 +28,7 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.11"
+__version__ = "0.8.12"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 
@@ -309,17 +310,16 @@ class SysModulesWatcher(Thread):
                 self.ignored.add(module_name)
 
 
-class AutoReloader(Thread):
+class AutoReloader:
     CURRENT_INSTANCE: ClassVar[ContextVar] = ContextVar("AutoReloader.CURRENT_INSTANCE")
 
     def __init__(
         self,
         *,
         reload_with_main: bool,
-        daemon: bool,
         debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
     ):
-        super().__init__(name=type(self).__name__, daemon=daemon)
+        self.ident = None
         self.running = False
         self.debounce_interval = debounce_interval
         self.queue = Queue[ModuleReloader | ResourceReloader]()
@@ -374,6 +374,7 @@ class AutoReloader(Thread):
 
         threads = [self.watchdog_observer, self.sys_modules_watcher]
         current_instance_token = type(self).CURRENT_INSTANCE.set(self)
+        self.ident = threading.get_ident()
         self.running = True
 
         try:
@@ -383,6 +384,7 @@ class AutoReloader(Thread):
             while self.running:
                 self.tick()
         finally:
+            self.ident = None
             with suppress(ValueError):
                 type(self).CURRENT_INSTANCE.reset(current_instance_token)
 
@@ -420,6 +422,8 @@ class AutoReloader(Thread):
             self.interruptable = False
 
     def interrupt(self):
+        if self.ident is None:
+            return
         if not self.interruptable:
             return
 
@@ -440,7 +444,6 @@ class ScriptAutoReloader(AutoReloader):
     ):
         super().__init__(
             reload_with_main=True,
-            daemon=False,
             debounce_interval=debounce_interval,
         )
         self.script_debouncer = Debouncer(interval=self.debounce_interval)
@@ -466,8 +469,7 @@ class ScriptAutoReloader(AutoReloader):
             super().reload(self.script_reloader)
 
     def execute(self):
-        self.start()
-        self.join()
+        self.run()
 
 
 class DaemonAutoReloader(AutoReloader):
@@ -478,9 +480,9 @@ class DaemonAutoReloader(AutoReloader):
     ):
         super().__init__(
             reload_with_main=False,
-            daemon=True,
             debounce_interval=debounce_interval,
         )
+        self.thread: Thread | None = None
         if script_path is not None:
             self.set_script(script_path)
 
@@ -491,10 +493,18 @@ class DaemonAutoReloader(AutoReloader):
         return reloader
 
     def execute(self):
-        self.start()
-        self.script_reloader.reload(with_main=True)
-        self.stop()
-        self.join()
+        self.thread = Thread(
+            target=self.run,
+            name=type(self).__name__,
+            daemon=True,
+        )
+        self.thread.start()
+
+        try:
+            self.script_reloader.reload(with_main=True)
+        finally:
+            self.stop()
+            self.thread.join()
 
 
 parser = argparse.ArgumentParser(description=__doc__.strip())
