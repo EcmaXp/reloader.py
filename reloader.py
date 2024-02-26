@@ -9,9 +9,11 @@ import argparse
 import ast
 import inspect
 import linecache
+import os
 import sys
 import threading
 import traceback
+import warnings
 from collections import Counter
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
@@ -28,14 +30,21 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.8.12"
+__version__ = "0.8.13"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 
 
 T = TypeVar("T")
 
+CLEAR_TERM = "\x1b[2J\x1b[H"
+
+
 DEFAULT_DEBOUNCE_INTERVAL = 0.1
+
+
+class ReloadUnsupportedWarning(UserWarning):
+    pass
 
 
 class InterruptExecution(BaseException):
@@ -136,6 +145,17 @@ class Chunk:
 
 
 class Patcher:
+    def exec(self, chunk: Chunk, module_globals: dict):
+        if self.check_patch_required(chunk):
+            with self.patch(module_globals):
+                chunk.exec(module_globals)
+        else:
+            chunk.exec(module_globals)
+
+    @staticmethod
+    def check_patch_required(chunk: Chunk):
+        return not isinstance(chunk.stmt, (ast.Import, ast.ImportFrom))
+
     @contextmanager
     def patch(self, module_globals: dict):
         old_globals = module_globals.copy()
@@ -152,14 +172,22 @@ class Patcher:
 
     def patch_object(self, old_value: Any, new_value: Any):
         if isinstance(new_value, MemberDescriptorType):
-            # TypeError: descriptor '<new_member>' for '<old_class>' objects doesn't apply to a '<old_class>' object # noqa
+            warnings.warn("MemberDescriptor is not supported", ReloadUnsupportedWarning)
             return old_value
-        if isinstance(old_value, type) and isinstance(new_value, type):
+        elif not self.check_object(old_value, new_value):
+            return new_value
+        elif isinstance(old_value, type) and isinstance(new_value, type):
             return self.patch_class(old_value, new_value)
         elif callable(old_value) and callable(new_value):
             return self.patch_callable(old_value, new_value)
         else:
             return new_value
+
+    @staticmethod
+    def check_object(old_value: Any, new_value: Any):
+        old_module = getattr(old_value, "__module__", None)
+        new_module = getattr(new_value, "__module__", None)
+        return old_module == new_module
 
     def patch_class(self, old_class: type, new_class: type):
         self.patch_vars(old_class, new_class)
@@ -222,8 +250,7 @@ class ModuleReloader:
             self.reload_chunk(chunk)
 
     def reload_chunk(self, chunk: Chunk):
-        with self.patcher.patch(self.module.__dict__):
-            chunk.exec(self.module.__dict__)
+        self.patcher.exec(chunk, self.module.__dict__)
 
     def load_lines(self):
         linecache.updatecache(self.module.__file__, self.module.__dict__)
@@ -510,6 +537,7 @@ class DaemonAutoReloader(AutoReloader):
 parser = argparse.ArgumentParser(description=__doc__.strip())
 parser.add_argument("--loop", "-l", action="store_true")
 parser.add_argument("--clear", "-c", action="store_true")
+parser.add_argument("--system-clear", "-C", action="store_true")
 parser.add_argument(
     "--debounce-interval",
     type=float,
@@ -524,10 +552,6 @@ parser.add_argument(
 )
 parser.add_argument("script", type=Path)
 parser.add_argument("argv", nargs=argparse.REMAINDER)
-
-
-def clear():
-    print(end="\x1b[2J\x1b[H", flush=True)
 
 
 def main():
@@ -549,8 +573,10 @@ def main():
     for path in args.resource_file:
         auto_reloader.watch_resource(path)
 
-    if args.clear:
-        auto_reloader.on_reload = lambda reloader: clear()
+    if args.system_clear:
+        auto_reloader.on_reload = lambda reloader: os.system("clear")
+    elif args.clear:
+        auto_reloader.on_reload = lambda reloader: print(end=CLEAR_TERM, flush=True)
 
     auto_reloader.execute()
 
