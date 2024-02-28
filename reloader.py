@@ -31,7 +31,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.10.3"
+__version__ = "0.10.4"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = ["Reloader", "DaemonReloader", "ScriptLoopReloader", "ScriptDaemonReloader"]
@@ -57,18 +57,21 @@ class FileSystemEventEmitter(FileSystemEventHandler):
         observer: Observer = None,
     ):
         self.observer = Observer() if observer is None else observer
+        self.files = set()
         self.parents = set()
         self.callback = callback
 
     def on_any_event(self, event: FileSystemEvent) -> None:
-        self.callback(event)
+        if event.src_path in self.files:
+            self.callback(event)
 
     def schedule(self, path: Path | PathLike | str):
         path = Path(path).resolve()
-        parent = path.parent
+        self.files.add(str(path))
+        parent = str(path.parent)
         if parent not in self.parents:
             self.parents.add(parent)
-            self.observer.schedule(self, str(parent))
+            self.observer.schedule(self, parent)
 
 
 class CodeChunk:
