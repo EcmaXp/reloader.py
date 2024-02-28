@@ -31,14 +31,12 @@ from watchdog.events import FileSystemEvent
 from watchdog.observers import Observer
 
 __author__ = "EcmaXp"
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = ["ScriptReloader", "DaemonReloader"]
 
 T = TypeVar("T")
-
-CLEAR_TERM = "\x1b[2J\x1b[H"
 
 
 DEFAULT_DEBOUNCE_INTERVAL = 0.1
@@ -395,7 +393,7 @@ class BaseReloader:
         return code_module
 
     def watch_resource(self, path: Path | PathLike | str) -> None:
-        self._watchdog_handler.add(path, partial(self._reload))
+        self._watchdog_handler.add(path, partial(self._reload, self._script_module))
 
     def _run(self):
         try:
@@ -543,7 +541,6 @@ class DaemonReloader(BaseReloader):
 parser = argparse.ArgumentParser(description=__doc__.strip())
 parser.add_argument("--loop", "-l", action="store_true")
 parser.add_argument("--clear", "-c", action="store_true")
-parser.add_argument("--system-clear", "-C", action="store_true")
 parser.add_argument(
     "--debounce-interval",
     type=float,
@@ -579,10 +576,8 @@ def main():
     for path in args.resource_file:
         reloader.watch_resource(path)
 
-    if args.system_clear:
+    if args.clear:
         reloader.before_tick = lambda: os.system("clear")
-    elif args.clear:
-        reloader.before_tick = lambda: print(end=CLEAR_TERM, flush=True)
 
     reloader.run()
 
