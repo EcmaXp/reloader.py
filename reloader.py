@@ -31,7 +31,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = ["Reloader", "DaemonReloader", "ScriptLoopReloader", "ScriptDaemonReloader"]
@@ -342,8 +342,21 @@ class Reloader:
         self._interruptable = False
 
     def _events_callback(self, events: list[FileSystemEvent | bool]):
-        self._queue.put(events)
-        self._interrupt()
+        new_events = []
+        for event in events:
+            if isinstance(event, FileSystemEvent):
+                if event.event_type not in ("modified", "created"):
+                    continue
+                elif event.src_path not in self._code_modules:
+                    continue
+
+                new_events.append(event)
+            elif isinstance(event, bool):
+                new_events.append(event)
+
+        if events:
+            self._queue.put(events)
+            self._interrupt()
 
     @classmethod
     def get_instance(cls) -> Reloader:
