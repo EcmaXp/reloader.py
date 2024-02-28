@@ -18,26 +18,26 @@ from collections import Counter
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from ctypes import pythonapi, c_long, py_object
-from functools import partial
 from os import PathLike
 from pathlib import Path
 from queue import Queue, Empty
 from threading import Thread
-from time import monotonic, sleep
+from time import sleep
 from types import ModuleType, MemberDescriptorType
-from typing import Any, Callable, ClassVar, cast, Generic, TypeVar
+from typing import Any, Callable, ClassVar, cast, TypeVar
 
-from watchdog.events import FileSystemEvent
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
+from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.9.1"
+__version__ = "0.10.0"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
-__all__ = ["ScriptReloader", "DaemonReloader"]
+__all__ = ["Reloader", "DaemonReloader", "ScriptLoopReloader", "ScriptDaemonReloader"]
+
 
 T = TypeVar("T")
-
 
 DEFAULT_DEBOUNCE_INTERVAL = 0.1
 
@@ -50,52 +50,22 @@ class Interrupted(BaseException):
     pass
 
 
-class Debouncer:
-    def __init__(self, interval: float = DEFAULT_DEBOUNCE_INTERVAL):
-        self.interval = interval
-        self.last = 0
-
-    def __call__(self):
-        now = monotonic()
-        if now - self.last < self.interval:
-            return False
-
-        self.last = now
-        return True
-
-
-class DebounceFileSystemEventHandler(Generic[T]):
+class FileSystemEventEmitter(FileSystemEventHandler):
     def __init__(
         self,
-        observer: Observer,
-        queue: Queue,
-        queued: Callable[[], None],
-        *,
-        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
+        callback: Callable[[FileSystemEvent], None],
+        observer: Observer = None,
     ):
-        self.observer = observer
-        self.queue = queue
+        self.observer = Observer() if observer is None else observer
         self.parents = set()
-        self.paths = {}
-        self.queued = queued
-        self.debouncers = {}
-        self.debounce_interval = debounce_interval
+        self.callback = callback
 
-    def dispatch(self, event: FileSystemEvent):
-        if event.event_type in ("created", "modified"):
-            path = Path(event.src_path).resolve()
-            obj = self.paths.get(path)
-            if obj and self.debouncers[path]():
-                self.queue.put(obj)
-                self.queued()
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        self.callback(event)
 
-    def add(self, path: Path | PathLike | str, obj: T):
+    def schedule(self, path: Path | PathLike | str):
         path = Path(path).resolve()
         parent = path.parent
-
-        self.paths[path] = obj
-        self.debouncers[path] = Debouncer(interval=self.debounce_interval)
-
         if parent not in self.parents:
             self.parents.add(parent)
             self.observer.schedule(self, str(parent))
@@ -348,32 +318,35 @@ class SysModulesWatcher(Thread):
                 self.ignored.add(module_name)
 
 
-class BaseReloader:
-    _CURRENT_INSTANCE: ClassVar[ContextVar] = ContextVar(
-        "AutoReloader.CURRENT_INSTANCE"
-    )
+class Reloader:
+    _CURRENT_INSTANCE: ClassVar[ContextVar] = ContextVar("Reloader.CURRENT_INSTANCE")
 
     def __init__(self, *, debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL):
-        self._script_module: CodeModule | None = None
-        self._debounce_interval = debounce_interval
-        self._queue = Queue[Callable]()
+        self._code_modules: dict[str, CodeModule | ScriptModule] = {}
+        self._queue = Queue[list[FileSystemEvent | bool]]()
+        self._watchdog_observer = Observer()
+        self._watchdog_debouncer = EventDebouncer(
+            debounce_interval_seconds=debounce_interval or sys.float_info.min,
+            events_callback=self._events_callback,
+        )
+        self._watchdog_handler = FileSystemEventEmitter(
+            callback=self._watchdog_debouncer.handle_event,
+            observer=self._watchdog_observer,
+        )
         self._sys_modules_watcher = SysModulesWatcher(
             check=self._check_module,
             callback=cast(Callable[[ModuleType], None], self.watch_module),
-        )
-        self._watchdog_observer = Observer()
-        self._watchdog_handler = DebounceFileSystemEventHandler[Callable](
-            observer=self._watchdog_observer,
-            queue=self._queue,
-            queued=self._interrupt,
-            debounce_interval=self._debounce_interval,
         )
         self._ident = None
         self._running = False
         self._interruptable = False
 
+    def _events_callback(self, events: list[FileSystemEvent | bool]):
+        self._queue.put(events)
+        self._interrupt()
+
     @classmethod
-    def get_instance(cls) -> BaseReloader:
+    def get_instance(cls) -> Reloader:
         try:
             return cls._CURRENT_INSTANCE.get()
         except LookupError as e:
@@ -387,13 +360,12 @@ class BaseReloader:
             return False
 
     def watch_module(self, module: ModuleType) -> CodeModule:
-        code_module = CodeModule(module)
-        code_reloader = partial(self._reload, code_module)
-        self._watchdog_handler.add(module.__file__, code_reloader)
+        self._code_modules[module.__file__] = code_module = CodeModule(module)
+        self._watchdog_handler.schedule(module.__file__)
         return code_module
 
     def watch_resource(self, path: Path | PathLike | str) -> None:
-        self._watchdog_handler.add(path, partial(self._reload, self._script_module))
+        self._watchdog_handler.schedule(path)
 
     def _run(self):
         try:
@@ -403,7 +375,11 @@ class BaseReloader:
         else:
             raise RuntimeError(f"{type(self).__name__} is already running")
 
-        threads = [self._watchdog_observer, self._sys_modules_watcher]
+        threads = [
+            self._watchdog_observer,
+            self._watchdog_debouncer,
+            self._sys_modules_watcher,
+        ]
         current_instance_token = type(self)._CURRENT_INSTANCE.set(self)
         self._ident = threading.get_ident()
         self._running = True
@@ -412,6 +388,7 @@ class BaseReloader:
             for thread in threads:
                 thread.start()
 
+            self._first_tick()
             while self._running:
                 self._tick()
         finally:
@@ -427,14 +404,27 @@ class BaseReloader:
 
     def _tick(self):
         try:
-            func = self._queue.get(timeout=1)
+            events = self._queue.get(timeout=1)
         except Empty:
             return
 
         self.before_tick()
-        func()
+
+        code_modules = {
+            self._code_modules.get(event.src_path)
+            for event in events
+            if isinstance(event, FileSystemEvent)
+            and event.event_type in ("modified", "created")
+        } - {None}
+
+        for code_module in code_modules:
+            self._reload(code_module)
+
         self.after_tick()
         self._queue.task_done()
+
+    def _first_tick(self):
+        pass
 
     def before_tick(self):
         pass
@@ -442,15 +432,20 @@ class BaseReloader:
     def after_tick(self):
         pass
 
+    def run(self):
+        self._run()
+
     def stop(self):
         self._running = False
         self._interrupt()
 
-    def _is_main_script(self, code_module: CodeModule | ScriptModule) -> bool:
-        return isinstance(code_module, ScriptModule)
-
-    def _reload(self, code_module: CodeModule | ScriptModule):
-        self._interruptable = is_main_script = self._is_main_script(code_module)
+    def _reload(
+        self,
+        code_module: CodeModule | ScriptModule,
+        *,
+        is_main_script: bool = False,
+    ):
+        self._interruptable = is_main_script
 
         try:
             code_module.reload(with_main=is_main_script)
@@ -469,60 +464,12 @@ class BaseReloader:
             )
 
 
-class ScriptReloader(BaseReloader):
-    def __init__(
-        self,
-        script_path: Path | PathLike = None,
-        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
-    ):
-        super().__init__(debounce_interval=debounce_interval)
-        self._script_reload_debouncer = Debouncer(interval=self._debounce_interval)
-        if script_path is not None:
-            self.watch_script(script_path)
-
-    def watch_script(self, script_path: Path | PathLike) -> ScriptModule:
-        self._script_module = script_module = ScriptModule(script_path)
-        script_reloader = partial(self._reload, script_module)
-        self._watchdog_handler.add(script_module.module.__file__, script_reloader)
-        self._queue.put(script_reloader)
-        self._script_reload_debouncer()
-        return script_module
-
-    def _reload(self, code_module: CodeModule):
-        super()._reload(code_module)
-
-        if (
-            self._script_module is not None
-            and self._script_module is not code_module
-            and self._script_reload_debouncer()
-        ):
-            super()._reload(self._script_module)
-
-    def run(self):
-        self._run()
-
-
-class DaemonReloader(BaseReloader):
-    def __init__(
-        self,
-        script_path: Path | PathLike = None,
-        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
-    ):
+class DaemonReloader(Reloader):
+    def __init__(self, *, debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL):
         super().__init__(debounce_interval=debounce_interval)
         self.thread: Thread | None = None
-        if script_path is not None:
-            self.set_script(script_path)
 
-    def set_script(self, script_path: Path | PathLike) -> ScriptModule:
-        self._script_module = script_module = ScriptModule(script_path)
-        script_reloader = partial(self._reload, script_module)
-        self._watchdog_handler.add(script_module.module.__file__, script_reloader)
-        return script_module
-
-    def _is_main_script(self, code_module: CodeModule | ScriptModule) -> bool:
-        return False
-
-    def run(self):
+    def start(self):
         self.thread = Thread(
             target=self._run,
             name=type(self).__name__,
@@ -530,12 +477,52 @@ class DaemonReloader(BaseReloader):
         )
         self.thread.start()
 
-        try:
-            self._script_module.run()
-        finally:
-            self._interrupt()
-            self.stop()
+    def run(self):
+        raise NotImplementedError
+
+    def join(self):
+        if self.thread:
             self.thread.join()
+
+
+class ScriptReloader(Reloader):
+    def __init__(
+        self,
+        script_path: Path | PathLike = None,
+        *,
+        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
+    ):
+        super().__init__(debounce_interval=debounce_interval)
+        self._script_module: ScriptModule | None = None
+        if script_path is not None:
+            self.watch_script(script_path)
+
+    def watch_script(self, script_path: Path | PathLike) -> ScriptModule:
+        self._script_module = script_module = ScriptModule(script_path)
+        self._code_modules[script_module.module.__file__] = script_module
+        self._watchdog_handler.schedule(script_module.module.__file__)
+        return script_module
+
+
+class ScriptLoopReloader(ScriptReloader):
+    def _first_tick(self):
+        if self._script_module:
+            self._queue.put([True])
+
+    def after_tick(self):
+        self._reload(self._script_module, is_main_script=True)
+
+
+class ScriptDaemonReloader(ScriptReloader, DaemonReloader):
+    def run(self):
+        self.start()
+        try:
+            self.before_tick()
+            self._script_module.run()
+            self.after_tick()
+        finally:
+            self.stop()
+            self.join()
 
 
 parser = argparse.ArgumentParser(description=__doc__.strip())
@@ -543,6 +530,7 @@ parser.add_argument("--loop", "-l", action="store_true")
 parser.add_argument("--clear", "-c", action="store_true")
 parser.add_argument(
     "--debounce-interval",
+    "-i",
     type=float,
     default=DEFAULT_DEBOUNCE_INTERVAL,
 )
@@ -567,11 +555,8 @@ def main():
 
     sys.path.insert(0, ".")
 
-    reloader_cls = ScriptReloader if args.loop else DaemonReloader
-    reloader = reloader_cls(
-        script_path,
-        debounce_interval=args.debounce_interval,
-    )
+    reloader_cls = ScriptLoopReloader if args.loop else ScriptDaemonReloader
+    reloader = reloader_cls(script_path, debounce_interval=args.debounce_interval)
 
     for path in args.resource_file:
         reloader.watch_resource(path)
