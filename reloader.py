@@ -31,7 +31,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = ["Reloader", "DaemonReloader", "ScriptLoopReloader", "ScriptDaemonReloader"]
@@ -354,8 +354,8 @@ class Reloader:
             elif isinstance(event, bool):
                 new_events.append(event)
 
-        if events:
-            self._queue.put(events)
+        if new_events:
+            self._queue.put(new_events)
             self._interrupt()
 
     @classmethod
