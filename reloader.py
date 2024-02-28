@@ -31,7 +31,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.10.2"
+__version__ = "0.10.3"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = ["Reloader", "DaemonReloader", "ScriptLoopReloader", "ScriptDaemonReloader"]
@@ -346,8 +346,6 @@ class Reloader:
         for event in events:
             if isinstance(event, FileSystemEvent):
                 if event.event_type not in ("modified", "created"):
-                    continue
-                elif event.src_path not in self._code_modules:
                     continue
 
                 new_events.append(event)
