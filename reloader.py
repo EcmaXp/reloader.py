@@ -3,6 +3,7 @@
 reloader.py - A simple script reloader
 inspired by jurigged[develoop] and watchdog
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,7 +32,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -256,7 +257,7 @@ class CodeModule:
         linecache.updatecache(self.file, self.module.__dict__)
 
         if self.module.__loader__:
-            lines, _ = inspect.getsourcelines(self.module)
+            lines = inspect.getsourcelines(self.module)[0][:]
         else:
             lines = self.path.read_text().splitlines(keepends=True)
 
