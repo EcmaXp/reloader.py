@@ -32,7 +32,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.11.1"
+__version__ = "0.12.0"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -649,6 +649,11 @@ parser.add_argument(
     action="append",
     default=[],
 )
+parser.add_argument(
+    "--pwd-python-path",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+)
 parser.add_argument("script", type=Path)
 parser.add_argument("argv", nargs=argparse.REMAINDER)
 
@@ -658,10 +663,14 @@ def main():
     if not args.loop and args.resource_file:
         parser.error("argument -f/--resource-file: --loop is required")
 
-    script_path = args.script.resolve()
+    script_path: Path = args.script.resolve()
+    if (script_path / "__main__.py").exists():
+        script_path /= "__main__.py"
+
     sys.argv = [str(script_path), *args.argv]
 
-    sys.path.insert(0, ".")
+    if args.pwd_python_path:
+        sys.path.insert(0, ".")
 
     reloader_cls = ScriptLoopReloader if args.loop else ScriptDaemonReloader
     reloader = reloader_cls(script_path, debounce_interval=args.debounce_interval)
