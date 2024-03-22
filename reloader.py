@@ -32,7 +32,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.12.0"
+__version__ = "0.12.1"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -287,11 +287,11 @@ class CodeModule:
 
         for code_chunk in code_chunks:
             if isinstance(code_chunk, CodeChunk):
-                if counter[code_chunk] > self.executed[code_chunk]:
-                    yield code_chunk
-                elif code_chunk.is_main:
+                if code_chunk.is_main:
                     if with_main:
                         yield code_chunk
+                elif counter[code_chunk] > self.executed[code_chunk]:
+                    yield code_chunk
 
     def reload(self, *, with_main: bool = False):
         for code_chunk in self.iter_reloadable_code_chunks(with_main=with_main):
@@ -653,6 +653,11 @@ parser.add_argument(
     "--pwd-python-path",
     action=argparse.BooleanOptionalAction,
     default=True,
+)
+parser.add_argument(
+    "--version",
+    action="version",
+    version=f"%(prog)s {__version__}",
 )
 parser.add_argument("script", type=Path)
 parser.add_argument("argv", nargs=argparse.REMAINDER)
