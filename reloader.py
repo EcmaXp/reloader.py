@@ -12,28 +12,27 @@ import inspect
 import linecache
 import os
 import sys
-import threading
 import traceback
 import warnings
 from collections import Counter
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
-from ctypes import pythonapi, c_long, py_object
+from ctypes import c_long, py_object, pythonapi
 from importlib.abc import MetaPathFinder
 from os import PathLike
 from pathlib import Path
-from queue import Queue, Empty
-from threading import Thread
+from queue import Empty, Queue
+from threading import Event, Thread, get_ident
 from time import sleep
-from types import ModuleType, MemberDescriptorType
-from typing import Any, Callable, ClassVar, cast, TypeVar
+from types import MemberDescriptorType, ModuleType
+from typing import Any, Callable, ClassVar, TypeVar, cast
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.12.2"
+__version__ = "0.12.3"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -359,7 +358,7 @@ class SysModulesWatcher(MetaPathFinder, Thread):
         self.callback = callback
         self.running = None
         self.found = set()
-        self.event = threading.Event()
+        self.event = Event()
 
     def start(self):
         self.watch_all()
@@ -492,7 +491,7 @@ class Reloader:
             raise RuntimeError(f"{type(self).__name__} is already running")
 
         current_instance_token = type(self)._CURRENT_INSTANCE.set(self)
-        self._ident = threading.get_ident()
+        self._ident = get_ident()
         self._running = True
 
         try:
