@@ -19,6 +19,7 @@ from collections import Counter
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from ctypes import pythonapi, c_long, py_object
+from importlib.abc import MetaPathFinder
 from os import PathLike
 from pathlib import Path
 from queue import Queue, Empty
@@ -32,7 +33,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.12.1"
+__version__ = "0.12.2"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -352,25 +353,37 @@ class ScriptModule(CodeModule):
         return module
 
 
-class SysModulesWatcher(Thread):
+class SysModulesWatcher(MetaPathFinder, Thread):
     def __init__(self, callback: Callable[[ModuleType], None]):
         super().__init__(name=type(self).__name__, daemon=True)
         self.callback = callback
         self.running = None
         self.found = set()
+        self.event = threading.Event()
 
     def start(self):
         self.watch_all()
+        sys.meta_path.insert(0, self)
         super().start()
+
+    def find_spec(self, fullname, path=None, target=None):
+        self.event.set()
+        return None
 
     def run(self):
         self.running = True
         while self.running:
+            sleep(0.1)
             self.watch_all()
-            sleep(1)
+            self.event.wait()
+            self.event.clear()
 
     def stop(self):
         self.running = False
+        self.event.set()
+
+        if self in sys.meta_path:
+            sys.meta_path.remove(self)
 
     def watch_all(self):
         modified_names = sys.modules.keys() - self.found
