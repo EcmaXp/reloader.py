@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import code
+import importlib.util
 import inspect
 import linecache
 import os
@@ -32,7 +34,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.12.3"
+__version__ = "0.13.0"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -588,6 +590,16 @@ class DaemonReloader(Reloader):
         self.thread.start()
 
     def run(self):
+        self.start()
+        try:
+            self.before_tick()
+            self._run_foreground()
+            self.after_tick()
+        finally:
+            self.stop()
+            self.join()
+
+    def _run_foreground(self):
         raise NotImplementedError
 
     def join(self):
@@ -613,11 +625,14 @@ class ScriptReloader(Reloader):
 
         return super().get_code_module(module_name)
 
-    def watch_script(self, script_path: Path | PathLike) -> ScriptModule:
-        self._script_module = script_module = ScriptModule(script_path)
+    def _watch_script_module(self, script_module: ScriptModule) -> ScriptModule:
+        self._script_module = script_module
         self._code_modules[script_module.module.__file__] = script_module
         self._watchdog_handler.schedule(script_module.module.__file__)
         return script_module
+
+    def watch_script(self, script_path: Path | PathLike) -> ScriptModule:
+        return self._watch_script_module(ScriptModule(script_path))
 
 
 class ScriptLoopReloader(ScriptReloader):
@@ -630,15 +645,38 @@ class ScriptLoopReloader(ScriptReloader):
 
 
 class ScriptDaemonReloader(ScriptReloader, DaemonReloader):
-    def run(self):
-        self.start()
-        try:
-            self.before_tick()
-            self._script_module.run()
-            self.after_tick()
-        finally:
-            self.stop()
-            self.join()
+    def _run_foreground(self):
+        self._script_module.run()
+
+
+class InteractiveDaemonReloader(ScriptDaemonReloader):
+    def __init__(
+        self,
+        code_module: ScriptModule | None = None,
+        *,
+        debounce_interval: float = DEFAULT_DEBOUNCE_INTERVAL,
+    ):
+        super().__init__(debounce_interval=debounce_interval)
+        if code_module is not None:
+            self._watch_script_module(code_module)
+
+    @classmethod
+    def from_reloader(cls, reloader: ScriptReloader):
+        self = cls(
+            reloader._script_module,  # noqa
+            debounce_interval=reloader._watchdog_debouncer.debounce_interval_seconds,
+        )
+        for path in reloader._watchdog_handler.files:
+            self.watch_resource(path)
+
+        return self
+
+    @property
+    def _script_module_dict(self):
+        return self._script_module.module.__dict__ if self._script_module else None
+
+    def _run_foreground(self):
+        code.interact(local=self._script_module_dict)
 
 
 def current_reloader() -> Reloader:
@@ -649,17 +687,22 @@ parser = argparse.ArgumentParser(description=__doc__.strip())
 parser.add_argument("--loop", "-l", action="store_true")
 parser.add_argument("--clear", "-c", action="store_true")
 parser.add_argument(
-    "--debounce-interval",
-    "-i",
-    type=float,
-    default=DEFAULT_DEBOUNCE_INTERVAL,
-)
-parser.add_argument(
-    "-f",
-    "--resource-file",
+    "--watch",
+    "-w",
     type=Path,
     action="append",
     default=[],
+)
+parser.add_argument(
+    "--interactive",
+    "-i",
+    action="store_true",
+)
+parser.add_argument(
+    "--debounce",
+    "-d",
+    type=float,
+    default=DEFAULT_DEBOUNCE_INTERVAL,
 )
 parser.add_argument(
     "--pwd-python-path",
@@ -671,34 +714,53 @@ parser.add_argument(
     action="version",
     version=f"%(prog)s {__version__}",
 )
-parser.add_argument("script", type=Path)
+parser.add_argument("-m", "--module", default=None)
+parser.add_argument("script", type=Path, nargs=argparse.OPTIONAL)
 parser.add_argument("argv", nargs=argparse.REMAINDER)
 
 
 def main():
     args = parser.parse_args()
-    if not args.loop and args.resource_file:
-        parser.error("argument -f/--resource-file: --loop is required")
+    if not args.loop and args.watch:
+        parser.error("argument -w/--watch: --loop is required")
 
-    script_path: Path = args.script.resolve()
+    if args.module:
+        spec = importlib.util.find_spec(args.module)
+        if not spec:
+            parser.error(f"module not found: {args.module}")
+
+        args.script = Path(spec.origin)
+
+    if not args.script:
+        args.script = Path(code.__file__)
+        args.interactive = False
+
+    script_path = args.script.resolve()
     if (script_path / "__main__.py").exists():
         script_path /= "__main__.py"
 
-    sys.argv = [str(script_path), *args.argv]
+    script_path = str(script_path)
+
+    sys.argv = [script_path, *args.argv]
 
     if args.pwd_python_path:
         sys.path.insert(0, ".")
 
     reloader_cls = ScriptLoopReloader if args.loop else ScriptDaemonReloader
-    reloader = reloader_cls(script_path, debounce_interval=args.debounce_interval)
+    reloader = reloader_cls(Path(script_path), debounce_interval=args.debounce)
 
-    for path in args.resource_file:
+    for path in args.watch:
         reloader.watch_resource(path)
 
     if args.clear:
         reloader.before_tick = lambda: os.system("clear")
 
-    reloader.run()
+    try:
+        reloader.run()
+    finally:
+        if args.interactive:
+            interactive_reloader = InteractiveDaemonReloader.from_reloader(reloader)
+            interactive_reloader.run()
 
 
 if __name__ == "__main__":
