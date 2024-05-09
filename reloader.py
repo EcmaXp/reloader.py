@@ -34,7 +34,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.14.0"
+__version__ = "0.14.1"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -506,6 +506,8 @@ class Watcher:
         self._watchdog_handler.schedule(code_module.module.__file__)
 
     def watch_resource(self, path: Path | PathLike | str) -> None:
+        path = Path(path).resolve()
+        self._resources.add(str(path))
         self._watchdog_handler.schedule(path)
 
     def start(self):
