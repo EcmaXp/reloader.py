@@ -34,7 +34,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.14.1"
+__version__ = "0.14.2"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -275,7 +275,7 @@ class CodeModule:
 
     @property
     def file(self):
-        return self.module.__file__
+        return inspect.getfile(self.module)
 
     @property
     def path(self):
@@ -484,12 +484,13 @@ class Watcher:
     @staticmethod
     def _check_module(module: ModuleType):
         try:
-            return module.__loader__.get_source(module.__name__) is not None  # noqa
-        except (AttributeError, ImportError, TypeError):
+            inspect.getsource(module)
+            return True
+        except (OSError, TypeError):
             return False
 
     def watch_module(self, module: ModuleType) -> CodeModule:
-        code_module = self._code_modules.get(module.__file__)
+        code_module = self._code_modules.get(inspect.getfile(module))
         if code_module is None:
             code_module = CodeModule(module)
             self.watch_code_module(code_module)
@@ -502,8 +503,8 @@ class Watcher:
         return script_module
 
     def watch_code_module(self, code_module: CodeModule) -> None:
-        self._code_modules[code_module.module.__file__] = code_module
-        self._watchdog_handler.schedule(code_module.module.__file__)
+        self._code_modules[code_module.file] = code_module
+        self._watchdog_handler.schedule(code_module.file)
 
     def watch_resource(self, path: Path | PathLike | str) -> None:
         path = Path(path).resolve()
