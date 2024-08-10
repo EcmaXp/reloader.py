@@ -34,7 +34,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.14.2"
+__version__ = "0.14.3"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -374,6 +374,9 @@ class ScriptModule(CodeModule):
         super().__init__(module)
         self.executed.clear()
 
+    def install_as_main_module(self):
+        sys.modules[self.name] = self.module
+
     def run(self, *, with_main: bool = True):
         self.reload(with_main=with_main)
 
@@ -499,6 +502,7 @@ class Watcher:
 
     def watch_script(self, script_path: Path | PathLike) -> ScriptModule:
         script_module = ScriptModule(script_path)
+        script_module.install_as_main_module()
         self.watch_code_module(script_module)
         return script_module
 
