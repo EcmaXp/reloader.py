@@ -1,6 +1,6 @@
 [project]
 name = "reloader.py"
-version = "0.16.0"
+version = "0.16.1"
 description = "A simple script reloader"
 license = "MIT"
 authors = [{ name = "EcmaXp", email = "ecmaxp@ecmaxp.kr" }]
@@ -28,6 +28,8 @@ Repository = "https://github.com/EcmaXp/reloader.py"
 
 [project.scripts]
 "reloader" = "reloader:main"
+"reloader-py" = "reloader:main"
+"reloader.py" = "reloader:main"
 
 [build-system]
 requires = ["hatchling"]
