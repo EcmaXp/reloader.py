@@ -1,6 +1,6 @@
 [project]
 name = "reloader.py"
-version = "0.16.2"
+version = "0.16.3"
 description = "A simple script reloader"
 license = "MIT"
 authors = [{ name = "EcmaXp", email = "ecmaxp@ecmaxp.kr" }]

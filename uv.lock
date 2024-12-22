@@ -3,7 +3,7 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "reloader-py"
-version = "0.16.2"
+version = "0.16.3"
 source = { editable = "." }
 dependencies = [
     { name = "watchdog" },

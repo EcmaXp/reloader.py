@@ -34,7 +34,7 @@ from watchdog.observers import Observer
 from watchdog.utils.event_debouncer import EventDebouncer
 
 __author__ = "EcmaXp"
-__version__ = "0.16.1"
+__version__ = "0.16.3"
 __license__ = "MIT"
 __url__ = "https://pypi.org/project/reloader.py/"
 __all__ = [
@@ -304,7 +304,8 @@ class CodeModule:
                 lines = inspect.getsourcelines(self.module)[0][:]
 
         if lines is None:
-            lines = self.path.read_text().splitlines(keepends=True)
+            content = self.path.read_text(encoding="utf-8", errors="replace")
+            lines = content.splitlines(keepends=True)
 
         return lines
 
